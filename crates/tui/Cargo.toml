@@ -1,0 +1,24 @@
+[package]
+name = "tokio-agent-tui"
+description = "ratatui frontend: streaming markdown, diff viewer, input editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio-agent-core.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+pulldown-cmark.workspace = true
+syntect.workspace = true
+similar.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+
+[lints]
+workspace = true

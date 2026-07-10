@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/provider",
+    "crates/tools",
+    "crates/tui",
+    "crates/config",
+    "crates/mcp",
+    "crates/plugin",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/adriankiezik/tokio-agent"
+
+[workspace.dependencies]
+tokio-agent-core = { path = "crates/core" }
+tokio-agent-provider = { path = "crates/provider" }
+tokio-agent-tools = { path = "crates/tools" }
+tokio-agent-tui = { path = "crates/tui" }
+tokio-agent-config = { path = "crates/config" }
+tokio-agent-mcp = { path = "crates/mcp" }
+tokio-agent-plugin = { path = "crates/plugin" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+toml = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+ratatui = "0.30"
+crossterm = "0.29"
+pulldown-cmark = "0.13"
+syntect = "5"
+similar = "2"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
+dirs = "6"
+insta = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+strip = true

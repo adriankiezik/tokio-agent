@@ -1,0 +1,21 @@
+[package]
+name = "tokio-agent-core"
+description = "Neutral types, Provider+Tool traits, agent loop, context management, orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio-agent-config.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
