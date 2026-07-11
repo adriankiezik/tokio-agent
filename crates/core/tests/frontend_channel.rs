@@ -158,6 +158,7 @@ async fn run_turn_collecting(
     let mut seq = Vec::new();
     while let Some(event) = events.recv().await {
         match event {
+            AgentEvent::AutomaticTurnStarted(_) => seq.push("automatic"),
             AgentEvent::TextDelta(_) => seq.push("text"),
             AgentEvent::ThinkingDelta(_) => seq.push("thinking"),
             AgentEvent::ToolStarted { .. } => seq.push("tool_start"),

@@ -1,9 +1,11 @@
 pub mod agent;
+mod autonomy;
 pub mod context;
 pub mod event;
 pub mod message;
 pub mod permission;
 pub mod provider;
+mod sleep;
 pub mod tool;
 mod tool_execution;
 

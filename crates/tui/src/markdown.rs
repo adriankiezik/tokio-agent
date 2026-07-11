@@ -508,6 +508,8 @@ impl Renderer {
             self.lines.push(Line::default());
         }
         let terminal = is_terminal_language(language);
+        let plain_surface =
+            terminal || is_configuration_language(language) || is_plain_text_language(language);
         let syntax_set = syntax_set();
         let syntax = syntax_set
             .find_syntax_by_token(language)
@@ -522,7 +524,7 @@ impl Renderer {
                 Ok(regions) => regions
                     .into_iter()
                     .map(|(style, text)| {
-                        let surface = if terminal {
+                        let surface = if plain_surface {
                             Style::new()
                         } else {
                             theme::picker_bg()
@@ -535,7 +537,7 @@ impl Renderer {
                     .filter(|(_, text)| !text.is_empty())
                     .collect(),
                 Err(_) => vec![(
-                    if terminal {
+                    if plain_surface {
                         Style::new()
                     } else {
                         theme::picker_bg()
@@ -543,7 +545,7 @@ impl Renderer {
                     source_line.to_owned(),
                 )],
             };
-            let wrapped = if terminal {
+            let wrapped = if plain_surface {
                 wrap_terminal_regions(&regions, self.width.max(1))
             } else {
                 wrap_code_surface_regions(&regions, self.width.max(1))
@@ -551,7 +553,7 @@ impl Renderer {
             self.lines.extend(wrapped);
         }
         if code.is_empty() {
-            if terminal {
+            if plain_surface {
                 self.lines.push(Line::from("  "));
             } else {
                 self.lines.push(Line::styled(
@@ -623,6 +625,31 @@ impl Renderer {
         self.current = Line::default();
         self.start_line();
     }
+}
+
+fn is_plain_text_language(language: &str) -> bool {
+    matches!(
+        language.to_ascii_lowercase().as_str(),
+        "" | "text" | "plaintext" | "plain" | "txt"
+    )
+}
+
+fn is_configuration_language(language: &str) -> bool {
+    matches!(
+        language.to_ascii_lowercase().as_str(),
+        "toml"
+            | "yaml"
+            | "yml"
+            | "json"
+            | "jsonc"
+            | "ini"
+            | "conf"
+            | "config"
+            | "dotenv"
+            | "env"
+            | "properties"
+            | "xml"
+    )
 }
 
 fn is_terminal_language(language: &str) -> bool {
@@ -947,6 +974,50 @@ mod tests {
                 "{language}"
             );
         }
+    }
+
+    #[test]
+    fn plain_text_and_unlabelled_fences_have_no_background() {
+        for source in [
+            "```text\ncargo test --workspace\n```",
+            "```plaintext\ncargo test --workspace\n```",
+            "```\ncargo test --workspace\n```",
+        ] {
+            let mut markdown = MarkdownBuffer::default();
+            markdown.push(source);
+            let lines = markdown.render(32);
+
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].to_string(), "  cargo test --workspace");
+            assert!(
+                lines[0].spans.iter().all(|span| span.style.bg.is_none()),
+                "plain-text fence unexpectedly had a background: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_fences_keep_highlighting_without_a_background() {
+        let mut markdown = MarkdownBuffer::default();
+        markdown.push("```toml\nprovider = \"deepseek\"\nauth = \"api_key\"\n```");
+        let lines = markdown.render(32);
+
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.spans.iter().all(|span| span.style.bg.is_none()))
+        );
+        let colors = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| !span.content.trim().is_empty())
+            .filter_map(|span| span.style.fg)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            colors.len() > 1,
+            "configuration syntax should stay highlighted"
+        );
     }
 
     #[test]

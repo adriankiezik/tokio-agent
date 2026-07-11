@@ -5,4 +5,5 @@
 /docs/
 *.md
 !README.md
+!goal-loop-analysis.md
 !crates/cli/src/default_system_prompt.md

@@ -51,6 +51,7 @@ impl Tool for Bash {
             };
 
             let mut command = tokio::process::Command::new("bash");
+            remove_cargo_build_context(&mut command);
             command
                 .arg("-c")
                 .arg(&args.command)
@@ -96,6 +97,34 @@ impl Tool for Bash {
 enum WaitError {
     Cancelled,
     Io(std::io::Error),
+}
+
+fn remove_cargo_build_context(command: &mut tokio::process::Command) {
+    for (name, _) in std::env::vars_os() {
+        if is_cargo_build_context(&name) {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn is_cargo_build_context(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    matches!(
+        name,
+        "CARGO_BIN_NAME"
+            | "CARGO_CRATE_NAME"
+            | "CARGO_MANIFEST_DIR"
+            | "CARGO_MANIFEST_PATH"
+            | "CARGO_PRIMARY_PACKAGE"
+            | "CARGO_TARGET_TMPDIR"
+            | "OUT_DIR"
+            | "RUST_RECURSION_COUNT"
+    ) || name.starts_with("CARGO_BIN_EXE_")
+        || name.starts_with("CARGO_CFG_")
+        || name.starts_with("CARGO_FEATURE_")
+        || name.starts_with("CARGO_PKG_")
 }
 
 #[cfg(unix)]
@@ -158,6 +187,34 @@ fn kill_process_tree(pid: Option<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifies_cargo_build_context_without_matching_user_configuration() {
+        assert!(is_cargo_build_context("CARGO_MANIFEST_DIR".as_ref()));
+        assert!(is_cargo_build_context("CARGO_PKG_VERSION".as_ref()));
+        assert!(is_cargo_build_context("CARGO_FEATURE_TLS".as_ref()));
+        assert!(is_cargo_build_context("RUST_RECURSION_COUNT".as_ref()));
+        assert!(!is_cargo_build_context("CARGO_HOME".as_ref()));
+        assert!(!is_cargo_build_context("CARGO_TARGET_DIR".as_ref()));
+        assert!(!is_cargo_build_context("RUSTFLAGS".as_ref()));
+    }
+
+    #[tokio::test]
+    async fn shell_does_not_inherit_cargo_build_context() {
+        assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
+
+        let mut command = tokio::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg("printf '%s:%s' \"${CARGO_MANIFEST_DIR-unset}\" \"$CARGO_HOME\"")
+            .env("CARGO_MANIFEST_DIR", "outer-package")
+            .env("CARGO_HOME", "preserved");
+        remove_cargo_build_context(&mut command);
+
+        let output = command.output().await.expect("run bash");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "unset:preserved");
+    }
 
     #[tokio::test]
     async fn cancellation_stops_a_running_shell_promptly() {

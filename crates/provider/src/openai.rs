@@ -20,6 +20,8 @@ const PROVIDER: &str = "openai";
 const DEFAULT_BASE: &str = "https://api.openai.com";
 const CHATGPT_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_EFFORT: &str = "medium";
+const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
+const CHATGPT_USER_AGENT: &str = "codex_cli_rs/0.144.1";
 
 enum Auth {
     ApiKey(String),
@@ -62,11 +64,13 @@ impl OpenAi {
         };
         let url = format!("{}{}", self.base.trim_end_matches('/'), path);
 
-        let mut request = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .json(&body);
+        let mut request = with_responses_lite_header(
+            self.client
+                .post(&url)
+                .header("content-type", "application/json")
+                .json(&body),
+            &req.model,
+        );
         request = match &self.auth {
             Auth::ApiKey(key) => request.bearer_auth(key),
             Auth::ChatGpt(auth) => {
@@ -78,9 +82,7 @@ impl OpenAi {
                     token = auth.access_token() => token,
                 }
                 .map_err(|e| ProviderError::fatal(e.to_string()))?;
-                request = request
-                    .bearer_auth(token)
-                    .header("originator", ORIGINATOR)
+                request = with_chatgpt_identity(request.bearer_auth(token))
                     .header("accept", "text/event-stream");
                 if let Some(account_id) = auth.account_id() {
                     request = request.header("chatgpt-account-id", account_id);
@@ -91,6 +93,58 @@ impl OpenAi {
 
         transport::open_event_stream(request, Assembler::new(), cancel).await
     }
+
+    async fn compact_history(
+        &self,
+        req: &Request,
+        cancel: CancellationToken,
+    ) -> Result<Option<Vec<Message>>, ProviderError> {
+        if req.messages.is_empty() {
+            return Ok(None);
+        }
+        let mut body = serde_json::to_value(build_body(req, false))
+            .map_err(|error| ProviderError::fatal(error.to_string()))?;
+        if let Some(object) = body.as_object_mut() {
+            for key in ["stream", "store", "include", "max_output_tokens"] {
+                object.remove(key);
+            }
+        }
+        let path = match self.auth {
+            Auth::ApiKey(_) => "/v1/responses/compact",
+            Auth::ChatGpt(_) => "/responses/compact",
+        };
+        let url = format!("{}{}", self.base.trim_end_matches('/'), path);
+        let mut request = with_responses_lite_header(
+            self.client
+                .post(url)
+                .header("content-type", "application/json")
+                .json(&body),
+            &req.model,
+        );
+        request = match &self.auth {
+            Auth::ApiKey(key) => request.bearer_auth(key),
+            Auth::ChatGpt(auth) => {
+                let token = auth
+                    .access_token()
+                    .await
+                    .map_err(|error| ProviderError::fatal(error.to_string()))?;
+                let mut request = with_chatgpt_identity(request.bearer_auth(token));
+                if let Some(account_id) = auth.account_id() {
+                    request = request.header("chatgpt-account-id", account_id);
+                }
+                request
+            }
+        };
+        let response: CompactResponse = transport::send_json(request, cancel).await?;
+        let messages = compacted_messages(response.output)?;
+        Ok((!messages.is_empty()).then_some(messages))
+    }
+}
+
+fn with_chatgpt_identity(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request
+        .header("originator", ORIGINATOR)
+        .header(reqwest::header::USER_AGENT, CHATGPT_USER_AGENT)
 }
 
 impl Provider for OpenAi {
@@ -109,6 +163,18 @@ impl Provider for OpenAi {
             caching: true,
             vision: true,
         }
+    }
+
+    fn supports_native_compaction(&self) -> bool {
+        true
+    }
+
+    fn compact<'a>(
+        &'a self,
+        req: &'a Request,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<Option<Vec<Message>>, ProviderError>> {
+        Box::pin(self.compact_history(req, cancel))
     }
 
     fn count_tokens<'a>(
@@ -131,11 +197,13 @@ impl Provider for OpenAi {
             }
             let path = "/v1/responses/input_tokens";
             let url = format!("{}{}", self.base.trim_end_matches('/'), path);
-            let mut request = self
-                .client
-                .post(url)
-                .header("content-type", "application/json")
-                .json(&body);
+            let mut request = with_responses_lite_header(
+                self.client
+                    .post(url)
+                    .header("content-type", "application/json")
+                    .json(&body),
+                &req.model,
+            );
             request = match &self.auth {
                 Auth::ApiKey(key) => request.bearer_auth(key),
                 Auth::ChatGpt(auth) => {
@@ -143,7 +211,7 @@ impl Provider for OpenAi {
                         .access_token()
                         .await
                         .map_err(|error| ProviderError::fatal(error.to_string()))?;
-                    let mut request = request.bearer_auth(token).header("originator", ORIGINATOR);
+                    let mut request = with_chatgpt_identity(request.bearer_auth(token));
                     if let Some(account_id) = auth.account_id() {
                         request = request.header("chatgpt-account-id", account_id);
                     }
@@ -159,6 +227,63 @@ impl Provider for OpenAi {
 #[derive(Deserialize)]
 struct TokenCount {
     input_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct CompactResponse {
+    output: Vec<Value>,
+}
+
+fn compacted_messages(output: Vec<Value>) -> Result<Vec<Message>, ProviderError> {
+    let mut messages = Vec::new();
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                let role = match item.get("role").and_then(Value::as_str) {
+                    Some("user") | Some("developer") => Role::User,
+                    Some("assistant") => Role::Assistant,
+                    _ => continue,
+                };
+                let text = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !text.is_empty() {
+                    messages.push(Message {
+                        role,
+                        blocks: vec![ContentBlock::Text {
+                            text,
+                            meta: ProviderMetadata::default(),
+                        }],
+                        usage: None,
+                    });
+                }
+            }
+            Some("compaction") => {
+                let encrypted_content = item
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderError::fatal("compact response omitted encrypted_content")
+                    })?
+                    .to_owned();
+                messages.push(Message {
+                    role: Role::Assistant,
+                    blocks: vec![ContentBlock::Compaction {
+                        encrypted_content,
+                        meta: ProviderMetadata::default(),
+                    }],
+                    usage: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(messages)
 }
 
 pub struct Assembler {
@@ -726,11 +851,17 @@ struct WireRequest<'a> {
 struct Reasoning {
     effort: String,
     summary: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<&'static str>,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireItem<'a> {
+    AdditionalTools {
+        role: &'static str,
+        tools: Vec<WireTool<'a>>,
+    },
     Message {
         role: &'a str,
         content: Vec<WireContent>,
@@ -752,6 +883,9 @@ enum WireItem<'a> {
     FunctionCallOutput {
         call_id: &'a str,
         output: &'a str,
+    },
+    Compaction {
+        encrypted_content: &'a str,
     },
 }
 
@@ -783,12 +917,8 @@ enum WireTool<'a> {
 }
 
 fn build_body(req: &Request, include_max_output_tokens: bool) -> WireRequest<'_> {
-    let mut input = Vec::new();
-    for msg in &req.messages {
-        wire_items(msg, &mut input);
-    }
-
-    let mut tools: Vec<_> = req
+    let responses_lite = uses_responses_lite(&req.model);
+    let function_tools: Vec<_> = req
         .tools
         .iter()
         .map(|t| WireTool::Function {
@@ -798,35 +928,81 @@ fn build_body(req: &Request, include_max_output_tokens: bool) -> WireRequest<'_>
             strict: false,
         })
         .collect();
-    tools.push(WireTool::WebSearch {
-        external_web_access: true,
-    });
+    let mut input = Vec::new();
+    let tools = if responses_lite {
+        input.push(WireItem::AdditionalTools {
+            role: "developer",
+            tools: function_tools,
+        });
+        if !req.system.is_empty() {
+            input.push(WireItem::Message {
+                role: "developer",
+                content: vec![WireContent::InputText {
+                    text: req.system.clone(),
+                }],
+            });
+        }
+        Vec::new()
+    } else {
+        let mut tools = function_tools;
+        tools.push(WireTool::WebSearch {
+            external_web_access: true,
+        });
+        tools
+    };
+    for msg in &req.messages {
+        wire_items(msg, &mut input);
+    }
 
     WireRequest {
         model: &req.model,
         stream: true,
         store: false,
-        instructions: if req.system.is_empty() {
+        instructions: if req.system.is_empty() || responses_lite {
             None
         } else {
             Some(&req.system)
         },
         input,
         tools,
-        parallel_tool_calls: true,
+        parallel_tool_calls: !responses_lite,
         reasoning: Reasoning {
             effort: req
                 .reasoning_effort
                 .clone()
                 .unwrap_or_else(|| DEFAULT_EFFORT.to_owned()),
             summary: "auto",
+            context: responses_lite.then_some("all_turns"),
         },
         include: vec!["reasoning.encrypted_content"],
         max_output_tokens: include_max_output_tokens.then_some(req.max_tokens),
     }
 }
 
+fn uses_responses_lite(model: &str) -> bool {
+    model.starts_with("gpt-5.6")
+}
+
+fn with_responses_lite_header(
+    request: reqwest::RequestBuilder,
+    model: &str,
+) -> reqwest::RequestBuilder {
+    if uses_responses_lite(model) {
+        request.header(RESPONSES_LITE_HEADER, "true")
+    } else {
+        request
+    }
+}
+
 fn wire_items<'a>(msg: &'a Message, out: &mut Vec<WireItem<'a>>) {
+    for block in &msg.blocks {
+        if let ContentBlock::Compaction {
+            encrypted_content, ..
+        } = block
+        {
+            out.push(WireItem::Compaction { encrypted_content });
+        }
+    }
     match msg.role {
         Role::User => {
             let text = collect_text(msg);
@@ -869,7 +1045,7 @@ fn wire_items<'a>(msg: &'a Message, out: &mut Vec<WireItem<'a>>) {
                         name,
                         arguments: args.get(),
                     }),
-                    ContentBlock::ToolResult { .. } => {}
+                    ContentBlock::ToolResult { .. } | ContentBlock::Compaction { .. } => {}
                 }
             }
         }
@@ -912,6 +1088,20 @@ mod tests {
 
     fn drive(assembler: &mut Assembler, frames: &[&str]) -> Vec<Event> {
         frames.iter().flat_map(|f| assembler.push(f)).collect()
+    }
+
+    #[test]
+    fn chatgpt_requests_identify_as_a_compatible_codex_version() {
+        let request = with_chatgpt_identity(reqwest::Client::new().get("http://localhost"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(CHATGPT_USER_AGENT)
+        );
     }
 
     #[tokio::test]
@@ -991,6 +1181,40 @@ mod tests {
     }
 
     #[test]
+    fn compact_output_preserves_user_messages_and_opaque_compaction_item() {
+        let messages = compacted_messages(vec![
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "original request"}]
+            }),
+            serde_json::json!({"type": "compaction", "encrypted_content": "opaque-summary"}),
+        ])
+        .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[0].blocks[0],
+            ContentBlock::Text { text, .. } if text == "original request"
+        ));
+        assert!(matches!(
+            &messages[1].blocks[0],
+            ContentBlock::Compaction { encrypted_content, .. } if encrypted_content == "opaque-summary"
+        ));
+
+        let req = Request {
+            model: "gpt-5.5".into(),
+            system: String::new(),
+            messages,
+            tools: Vec::new(),
+            max_tokens: 1024,
+            reasoning_effort: Some("medium".into()),
+        };
+        let wire = serde_json::to_value(build_body(&req, false)).unwrap();
+        assert_eq!(wire["input"][1]["type"], "compaction");
+        assert_eq!(wire["input"][1]["encrypted_content"], "opaque-summary");
+    }
+
+    #[test]
     fn interruption_preserves_partial_reasoning_metadata() {
         let mut asm = Assembler::new();
         drive(
@@ -1031,7 +1255,7 @@ mod tests {
     #[test]
     fn body_uses_responses_shape_with_reasoning_and_roundtrips_items() {
         let req = Request {
-            model: "gpt-5.6-sol".to_owned(),
+            model: "gpt-5.5".to_owned(),
             system: "sys".to_owned(),
             messages: vec![
                 Message {
@@ -1103,9 +1327,62 @@ mod tests {
     }
 
     #[test]
+    fn responses_lite_body_matches_codex_contract() {
+        let req = Request {
+            model: "gpt-5.6-luna".to_owned(),
+            system: "system prompt".to_owned(),
+            messages: vec![],
+            tools: vec![ToolDef {
+                name: "read".to_owned(),
+                description: "read a file".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }],
+            max_tokens: 8192,
+            reasoning_effort: Some("high".to_owned()),
+        };
+
+        let wire = serde_json::to_value(build_body(&req, false)).unwrap();
+        assert!(wire.get("instructions").is_none());
+        assert!(wire.get("tools").is_none());
+        assert_eq!(wire["parallel_tool_calls"], false);
+        assert_eq!(wire["reasoning"]["context"], "all_turns");
+        assert_eq!(wire["input"][0]["type"], "additional_tools");
+        assert_eq!(wire["input"][0]["role"], "developer");
+        assert_eq!(wire["input"][0]["tools"][0]["name"], "read");
+        assert_eq!(wire["input"][1]["role"], "developer");
+        assert_eq!(wire["input"][1]["content"][0]["text"], "system prompt");
+        assert!(uses_responses_lite("gpt-5.6-sol"));
+        assert!(uses_responses_lite("gpt-5.6-terra"));
+        assert!(uses_responses_lite("gpt-5.6-luna"));
+        assert!(!uses_responses_lite("gpt-5.5"));
+
+        let client = reqwest::Client::new();
+        let lite_request =
+            with_responses_lite_header(client.post("http://localhost/responses"), "gpt-5.6-luna")
+                .build()
+                .unwrap();
+        assert_eq!(
+            lite_request
+                .headers()
+                .get(RESPONSES_LITE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let regular_request =
+            with_responses_lite_header(client.post("http://localhost/responses"), "gpt-5.5")
+                .build()
+                .unwrap();
+        assert!(
+            !regular_request
+                .headers()
+                .contains_key(RESPONSES_LITE_HEADER)
+        );
+    }
+
+    #[test]
     fn chatgpt_body_omits_unsupported_max_output_tokens() {
         let req = Request {
-            model: "gpt-5.6-sol".to_owned(),
+            model: "gpt-5.5".to_owned(),
             system: String::new(),
             messages: vec![],
             tools: vec![],
@@ -1252,7 +1529,11 @@ mod tests {
         };
         let wire = serde_json::to_value(build_body(&req, true)).unwrap();
         assert!(
-            wire["input"].as_array().unwrap().is_empty(),
+            wire["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "reasoning"),
             "reasoning without encrypted content cannot be replayed and must be dropped"
         );
         assert!(wire.get("instructions").is_none(), "empty system omitted");

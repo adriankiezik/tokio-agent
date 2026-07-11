@@ -36,10 +36,12 @@ pub fn run<P: Provider + 'static>(agent: Agent<P>) -> io::Result<RunOutcome> {
     let handle = runtime.handle().clone();
     theme::init_terminal_bg(query_terminal_bg());
     let session = SessionDisplay {
+        provider: agent.provider_name().to_owned(),
         model: agent.model().to_owned(),
         effort: agent.reasoning_effort().map(str::to_owned),
         cwd: agent.cwd().to_path_buf(),
-        context_window: agent.context_window(),
+        context_window: agent.context_before_compaction(),
+        max_output_tokens: agent.max_output_tokens(),
         permission_mode: agent.permission_mode(),
         history: tokio_agent_config::recent_messages().unwrap_or_else(|error| {
             tracing::warn!(%error, "failed to load recent message history");
@@ -137,10 +139,12 @@ struct App {
 }
 
 struct SessionDisplay {
+    provider: String,
     model: String,
     effort: Option<String>,
     cwd: std::path::PathBuf,
     context_window: Option<u64>,
+    max_output_tokens: u32,
     permission_mode: Mode,
     history: Vec<String>,
 }
@@ -148,10 +152,12 @@ struct SessionDisplay {
 impl Default for SessionDisplay {
     fn default() -> Self {
         Self {
+            provider: String::new(),
             model: String::new(),
             effort: None,
             cwd: std::path::PathBuf::new(),
             context_window: None,
+            max_output_tokens: 0,
             permission_mode: Mode::Suggest,
             history: Vec::new(),
         }
@@ -185,10 +191,12 @@ impl App {
     ) -> Self {
         Self {
             projection: FrontendProjection::new(
+                session.provider,
                 session.model,
                 session.effort,
                 display_path(&session.cwd),
                 session.context_window,
+                session.max_output_tokens,
                 session.permission_mode,
                 session.history,
             ),
@@ -300,6 +308,17 @@ impl App {
                             tracing::warn!(%error, "failed to persist permission mode");
                         }
                     }
+                    UiCommand::SetModel(model) => {
+                        if let Err(error) = tokio_agent_config::store_model_selection(model) {
+                            tracing::warn!(%error, "failed to persist model selection");
+                        }
+                    }
+                    UiCommand::SetReasoningEffort(Some(effort)) => {
+                        if let Err(error) = tokio_agent_config::store_reasoning_effort(effort) {
+                            tracing::warn!(%error, "failed to persist reasoning effort");
+                        }
+                    }
+                    UiCommand::SetReasoningEffort(None) => {}
                     UiCommand::UserMessage(message) => {
                         if let Err(error) = tokio_agent_config::store_recent_message(message) {
                             tracing::warn!(%error, "failed to persist recent message");

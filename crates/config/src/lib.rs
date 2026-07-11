@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const KEYCHAIN_SERVICE: &str = "tokio-agent";
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
@@ -35,7 +35,7 @@ pub enum ConfigError {
     MissingKey(String, String),
     #[error("keychain error: {0}")]
     Keychain(String),
-    #[error("unknown provider '{0}' — supported providers: anthropic, openai")]
+    #[error("unknown provider '{0}' — supported providers: anthropic, openai, deepseek")]
     UnknownProvider(String),
     #[error("unknown auth '{0}' — use \"chatgpt\" or \"api_key\"")]
     UnknownAuth(String),
@@ -47,6 +47,7 @@ pub enum ConfigError {
 pub enum ProviderKind {
     Anthropic,
     OpenAi,
+    DeepSeek,
 }
 
 impl ProviderKind {
@@ -55,6 +56,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::DeepSeek => "deepseek",
         }
     }
 }
@@ -213,6 +215,7 @@ impl Config {
         let provider = match self.provider.as_str() {
             "anthropic" => ProviderKind::Anthropic,
             "openai" => ProviderKind::OpenAi,
+            "deepseek" => ProviderKind::DeepSeek,
             other => return Err(ConfigError::UnknownProvider(other.to_owned())),
         };
         let auth = match self.auth.as_deref() {
@@ -251,28 +254,43 @@ pub fn store_provider_selection(
     provider: ProviderKind,
     auth: AuthKind,
     model: &str,
+    reasoning_effort: Option<&str>,
 ) -> Result<(), ConfigError> {
-    let path = selection_config_path().ok_or_else(|| ConfigError::Write {
-        path: PathBuf::from("selection.toml"),
-        source: std::io::Error::other("configuration directory is unavailable"),
-    })?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
-            path: path.clone(),
-            source,
-        })?;
-    }
-    let auth = match auth {
-        AuthKind::ChatGpt => "chatgpt",
-        AuthKind::ApiKey => "api_key",
+    store_provider_selection_at(&selection_path()?, provider, auth, model, reasoning_effort)
+}
+
+pub fn store_model_selection(model: &str) -> Result<(), ConfigError> {
+    update_selection_at(&selection_path()?, |selection| {
+        selection.model = Some(model.to_owned());
+    })
+}
+
+pub fn store_reasoning_effort(effort: &str) -> Result<(), ConfigError> {
+    update_selection_at(&selection_path()?, |selection| {
+        selection.reasoning_effort = Some(effort.to_owned());
+    })
+}
+
+fn store_provider_selection_at(
+    path: &Path,
+    provider: ProviderKind,
+    auth: AuthKind,
+    model: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<(), ConfigError> {
+    let selection = Selection {
+        provider: Some(provider.as_str().to_owned()),
+        auth: Some(
+            match auth {
+                AuthKind::ChatGpt => "chatgpt",
+                AuthKind::ApiKey => "api_key",
+            }
+            .to_owned(),
+        ),
+        model: Some(model.to_owned()),
+        reasoning_effort: reasoning_effort.map(str::to_owned),
     };
-    let text = format!(
-        "provider = {:?}\nauth = {:?}\nmodel = {:?}\n",
-        provider.as_str(),
-        auth,
-        model
-    );
-    std::fs::write(&path, text).map_err(|source| ConfigError::Write { path, source })
+    write_selection(path, &selection)
 }
 
 pub fn store_permission_mode(mode: PermissionMode) -> Result<(), ConfigError> {
@@ -301,7 +319,8 @@ pub fn store_recent_message(message: &str) -> Result<(), ConfigError> {
 fn known_context_window(provider: ProviderKind, model: &str) -> Option<u64> {
     match provider {
         ProviderKind::Anthropic
-            if model.starts_with("claude-sonnet-5")
+            if model.starts_with("claude-fable-5")
+                || model.starts_with("claude-sonnet-5")
                 || model.starts_with("claude-sonnet-4-6")
                 || model.starts_with("claude-opus-4-6")
                 || model.starts_with("claude-opus-4-7")
@@ -310,8 +329,18 @@ fn known_context_window(provider: ProviderKind, model: &str) -> Option<u64> {
             Some(1_000_000)
         }
         ProviderKind::Anthropic if model.starts_with("claude-") => Some(200_000),
-        ProviderKind::OpenAi if model.starts_with("gpt-5.4") || model.starts_with("gpt-5.6") => {
-            Some(1_050_000)
+        ProviderKind::OpenAi if model.starts_with("gpt-5.6") => Some(372_000),
+        ProviderKind::OpenAi if model == "gpt-5.4" => Some(1_000_000),
+        ProviderKind::OpenAi if matches!(model, "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.2") => {
+            Some(272_000)
+        }
+        ProviderKind::DeepSeek
+            if matches!(
+                model,
+                "deepseek-v4-flash" | "deepseek-v4-pro" | "deepseek-chat" | "deepseek-reasoner"
+            ) =>
+        {
+            Some(1_000_000)
         }
         _ => None,
     }
@@ -323,12 +352,67 @@ impl Default for Config {
     }
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Selection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+}
+
 fn user_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("tokio-agent").join("config.toml"))
 }
 
 fn selection_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("tokio-agent").join("selection.toml"))
+}
+
+fn selection_path() -> Result<PathBuf, ConfigError> {
+    selection_config_path().ok_or_else(|| ConfigError::Write {
+        path: PathBuf::from("selection.toml"),
+        source: std::io::Error::other("configuration directory is unavailable"),
+    })
+}
+
+fn update_selection_at(
+    path: &Path,
+    update: impl FnOnce(&mut Selection),
+) -> Result<(), ConfigError> {
+    let mut selection = read_selection(path)?;
+    update(&mut selection);
+    write_selection(path, &selection)
+}
+
+fn read_selection(path: &Path) -> Result<Selection, ConfigError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.to_owned(),
+            source,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Selection::default()),
+        Err(source) => Err(ConfigError::Read {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+fn write_selection(path: &Path, selection: &Selection) -> Result<(), ConfigError> {
+    ensure_parent(path)?;
+    let text = toml::to_string(selection).map_err(|error| ConfigError::Write {
+        path: path.to_owned(),
+        source: std::io::Error::other(error),
+    })?;
+    std::fs::write(path, text).map_err(|source| ConfigError::Write {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 fn runtime_config_path() -> Option<PathBuf> {
@@ -489,6 +573,18 @@ mod tests {
     fn resolves_known_context_windows_and_preserves_overrides() {
         let claude = Config::default().resolve().unwrap();
         assert_eq!(claude.context_window_tokens, Some(1_000_000));
+        assert_eq!(
+            known_context_window(ProviderKind::OpenAi, "gpt-5.6-sol"),
+            Some(372_000)
+        );
+        assert_eq!(
+            known_context_window(ProviderKind::OpenAi, "gpt-5.4"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            known_context_window(ProviderKind::OpenAi, "gpt-5.4-mini"),
+            Some(272_000)
+        );
 
         let custom = Config {
             context_window_tokens: Some(64_000),
@@ -497,6 +593,35 @@ mod tests {
         .resolve()
         .unwrap();
         assert_eq!(custom.context_window_tokens, Some(64_000));
+    }
+
+    #[test]
+    fn provider_model_and_effort_round_trip_as_selection_state() {
+        let path = temp_path("selection.toml");
+
+        store_provider_selection_at(
+            &path,
+            ProviderKind::OpenAi,
+            AuthKind::ChatGpt,
+            "gpt-5.6-sol",
+            Some("high"),
+        )
+        .unwrap();
+        update_selection_at(&path, |selection| {
+            selection.model = Some("gpt-5.6-terra".into());
+            selection.reasoning_effort = Some("max".into());
+        })
+        .unwrap();
+
+        let selection = read_selection(&path).unwrap();
+        assert_eq!(selection.provider.as_deref(), Some("openai"));
+        assert_eq!(selection.auth.as_deref(), Some("chatgpt"));
+        assert_eq!(selection.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("max"));
+        let layer = read_layer(&path).unwrap().unwrap();
+        assert_eq!(layer.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(layer.reasoning_effort.as_deref(), Some("max"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

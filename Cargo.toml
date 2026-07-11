@@ -53,6 +53,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
+keepawake = "0.6"
 dirs = "6"
 base64 = "0.22"
 sha2 = "0.10"

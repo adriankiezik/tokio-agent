@@ -5,7 +5,7 @@ use anyhow::Context;
 use tokio_agent_config::{AuthKind, Config, PermissionMode, ProviderKind, ResolvedConfig};
 use tokio_agent_core::agent::{Agent, ModelConfig};
 use tokio_agent_core::permission::{Mode, PermissionEngine};
-use tokio_agent_provider::{Anthropic, AnyProvider, OpenAi};
+use tokio_agent_provider::{Anthropic, AnyProvider, DeepSeek, OpenAi};
 
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_system_prompt.md");
 
@@ -44,7 +44,10 @@ impl<'a> SessionBuilder<'a> {
             permission_mode,
             system_prompt,
         } = self.config;
-        let supports_reasoning_effort = matches!(provider_kind, ProviderKind::OpenAi);
+        let supports_reasoning_effort = matches!(
+            provider_kind,
+            ProviderKind::Anthropic | ProviderKind::OpenAi | ProviderKind::DeepSeek
+        );
         let mode = match permission_mode {
             PermissionMode::Suggest => Mode::Suggest,
             PermissionMode::AutoEdit => Mode::AutoEdit,
@@ -62,6 +65,11 @@ impl<'a> SessionBuilder<'a> {
             ProviderKind::OpenAi => {
                 AnyProvider::OpenAi(Self::build_openai(provider_kind, auth, api_base)?)
             }
+            ProviderKind::DeepSeek => {
+                let api_key = tokio_agent_config::api_key(provider_kind.as_str())
+                    .context("resolving API key")?;
+                AnyProvider::DeepSeek(DeepSeek::new(api_key, api_base))
+            }
         };
         let system = system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned());
 
@@ -78,6 +86,7 @@ impl<'a> SessionBuilder<'a> {
             self.cwd.to_path_buf(),
         )
         .with_reasoning_effort_support(supports_reasoning_effort)
+        .with_provider_name(provider_kind.as_str())
         .with_context_window(context_window_tokens))
     }
 

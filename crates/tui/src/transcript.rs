@@ -41,6 +41,7 @@ pub(super) struct Transcript {
     thinking_open: bool,
     hovered_tool: Option<usize>,
     tool_areas: Vec<(usize, Rect)>,
+    previous_max_scroll: Option<usize>,
 }
 
 impl Transcript {
@@ -57,6 +58,7 @@ impl Transcript {
         self.cells.clear();
         self.hovered_tool = None;
         self.tool_areas.clear();
+        self.previous_max_scroll = None;
         self.close_streams();
     }
 
@@ -185,7 +187,8 @@ impl Transcript {
             }
         }
         let max_scroll = lines.len().saturating_sub(usize::from(area.height));
-        *scroll_up = (*scroll_up).min(max_scroll);
+        *scroll_up = anchored_scroll(*scroll_up, self.previous_max_scroll, max_scroll);
+        self.previous_max_scroll = Some(max_scroll);
         let viewport_start = max_scroll - *scroll_up;
         let viewport_end = viewport_start + usize::from(area.height);
         self.tool_areas = tool_ranges
@@ -240,6 +243,20 @@ impl Transcript {
     }
 }
 
+fn anchored_scroll(
+    scroll_up: usize,
+    previous_max_scroll: Option<usize>,
+    max_scroll: usize,
+) -> usize {
+    if scroll_up == 0 {
+        return 0;
+    }
+    let viewport_start = previous_max_scroll
+        .unwrap_or(max_scroll)
+        .saturating_sub(scroll_up);
+    max_scroll.saturating_sub(viewport_start).min(max_scroll)
+}
+
 fn append_cell(
     lines: &mut Vec<Line<'static>>,
     cell: &Cell,
@@ -267,14 +284,8 @@ fn append_cell(
                 theme::dim()
             }
             .add_modifier(ratatui::style::Modifier::ITALIC);
-            const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-            let prefix = if *active {
-                format!("{} ", SPINNER[(spinner / 4) % SPINNER.len()])
-            } else {
-                "  ".to_owned()
-            };
             lines.push(Line::from(vec![
-                Span::styled(prefix, theme::assistant_bullet()),
+                Span::raw("  "),
                 Span::styled(summary, style),
             ]));
         }
@@ -567,6 +578,24 @@ mod tests {
     }
 
     #[test]
+    fn transcript_growth_preserves_a_manually_scrolled_viewport() {
+        let previous_max_scroll = 100;
+        let scroll_up = 25;
+        let previous_viewport_start = previous_max_scroll - scroll_up;
+
+        let new_max_scroll = 107;
+        let anchored = anchored_scroll(scroll_up, Some(previous_max_scroll), new_max_scroll);
+
+        assert_eq!(new_max_scroll - anchored, previous_viewport_start);
+        assert_eq!(anchored, 32);
+    }
+
+    #[test]
+    fn transcript_growth_still_follows_output_when_at_the_bottom() {
+        assert_eq!(anchored_scroll(0, Some(100), 107), 0);
+    }
+
+    #[test]
     fn thinking_is_separate_from_visible_answer() {
         let mut t = Transcript::new();
         t.thinking_delta("reason");
@@ -576,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn active_thinking_has_a_visible_spinner_and_pulsing_summary() {
+    fn active_thinking_has_no_spinner_and_keeps_its_pulsing_summary() {
         let mut t = Transcript::new();
         t.thinking_delta("**Inspecting CLI source and help commands**");
 
@@ -586,7 +615,8 @@ mod tests {
         assert!(rendered.contains("Inspecting CLI source and help commands"));
         assert!(!rendered.contains("thinking"));
         assert!(!rendered.contains("**"));
-        assert!(rendered.starts_with("⠋ "));
+        assert_eq!(rendered, "  Inspecting CLI source and help commands");
+        assert_eq!(lines[0].spans[0].content, "  ");
         assert_eq!(
             lines[0].spans[1].style,
             theme::thinking_pulse(0).add_modifier(ratatui::style::Modifier::ITALIC)
@@ -600,7 +630,7 @@ mod tests {
 
         let mut next_frame = Vec::new();
         append_cell(&mut next_frame, &t.cells[0], 120, 24, false);
-        assert_ne!(next_frame[0].to_string(), rendered);
+        assert_eq!(next_frame[0].to_string(), rendered);
         assert_ne!(lines[0].spans[1].style, next_frame[0].spans[1].style);
     }
 

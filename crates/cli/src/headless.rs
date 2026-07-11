@@ -37,6 +37,10 @@ impl Printer {
         commands: &UnboundedSender<UiCommand>,
     ) -> Option<Result<tokio_agent_core::event::StopReason, AgentError>> {
         match event {
+            AgentEvent::AutomaticTurnStarted(_) => {
+                self.end_text();
+                eprintln!("\x1b[2m[automatic turn]\x1b[0m");
+            }
             AgentEvent::TextDelta(text) => {
                 print!("{text}");
                 let _ = std::io::stdout().flush();

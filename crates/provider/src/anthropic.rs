@@ -408,6 +408,13 @@ struct WireRequest<'a> {
     messages: Vec<WireMessage<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig<'a>>,
+}
+
+#[derive(Serialize)]
+struct OutputConfig<'a> {
+    effort: &'a str,
 }
 
 #[derive(Serialize)]
@@ -468,6 +475,10 @@ fn build_body(req: &Request) -> WireRequest<'_> {
         },
         messages,
         tools,
+        output_config: req
+            .reasoning_effort
+            .as_deref()
+            .map(|effort| OutputConfig { effort }),
     }
 }
 
@@ -510,6 +521,7 @@ fn wire_content(block: &ContentBlock) -> Option<WireContent<'_>> {
                 is_error: *is_error,
             })
         }
+        ContentBlock::Compaction { .. } => None,
     }
 }
 
@@ -718,11 +730,12 @@ mod tests {
                 input_schema: json!({"type": "object"}),
             }],
             max_tokens: 256,
-            reasoning_effort: None,
+            reasoning_effort: Some("high".to_owned()),
         };
 
         let wire = serde_json::to_value(build_body(&req)).unwrap();
         assert_eq!(wire["stream"], true);
+        assert_eq!(wire["output_config"]["effort"], "high");
         let messages = wire["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"][0]["type"], "tool_result");

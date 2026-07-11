@@ -58,12 +58,52 @@ impl ContextAssembler {
     }
 
     #[must_use]
+    pub fn max_tokens(&self) -> u32 {
+        self.max_tokens
+    }
+
+    #[must_use]
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.reasoning_effort.as_deref()
     }
 
+    pub fn set_model(&mut self, model: String) {
+        self.model = model;
+    }
+
+    pub fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort = effort;
+    }
+
     pub fn clear(&mut self) {
         self.transcript.clear();
+    }
+
+    pub fn replace_transcript(&mut self, transcript: Vec<Message>) {
+        self.transcript = transcript;
+    }
+
+    #[must_use]
+    pub fn estimated_input_tokens(&self) -> u64 {
+        let bytes = self.system.len()
+            + self
+                .transcript
+                .iter()
+                .flat_map(|message| &message.blocks)
+                .map(|block| match block {
+                    ContentBlock::Text { text, .. } | ContentBlock::Thinking { text, .. } => {
+                        text.len()
+                    }
+                    ContentBlock::ToolCall { name, args, .. } => name.len() + args.get().len(),
+                    ContentBlock::ToolResult { output, .. } => match output {
+                        ToolOutput::Text(text) => text.len(),
+                    },
+                    ContentBlock::Compaction {
+                        encrypted_content, ..
+                    } => encrypted_content.len(),
+                })
+                .sum::<usize>();
+        u64::try_from(bytes.div_ceil(4)).unwrap_or(u64::MAX)
     }
 
     pub fn push_user(&mut self, text: String) {

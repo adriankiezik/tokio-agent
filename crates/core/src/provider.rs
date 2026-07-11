@@ -68,4 +68,16 @@ pub trait Provider: Send + Sync {
     ) -> BoxFuture<'a, Result<u64, ProviderError>> {
         Box::pin(async { Err(ProviderError::fatal("token counting is not supported")) })
     }
+
+    fn supports_native_compaction(&self) -> bool {
+        false
+    }
+
+    fn compact<'a>(
+        &'a self,
+        _req: &'a Request,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<Option<Vec<Message>>, ProviderError>> {
+        Box::pin(async { Ok(None) })
+    }
 }

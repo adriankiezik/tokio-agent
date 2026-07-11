@@ -78,6 +78,11 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "ProviderMetadata::is_empty")]
         meta: ProviderMetadata,
     },
+    Compaction {
+        encrypted_content: String,
+        #[serde(default, skip_serializing_if = "ProviderMetadata::is_empty")]
+        meta: ProviderMetadata,
+    },
 }
 
 impl ContentBlock {

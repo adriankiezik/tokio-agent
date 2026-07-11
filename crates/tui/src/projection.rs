@@ -40,15 +40,39 @@ struct SlashCommand {
 #[derive(Clone, Copy)]
 enum SlashAction {
     Clear,
+    Effort,
+    Model,
+    Goal,
+    Loop,
     Permissions,
     Provider,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 3] = [
+const SLASH_COMMANDS: [SlashCommand; 7] = [
     SlashCommand {
         name: "/clear",
         description: "Clear the conversation and start fresh",
         action: SlashAction::Clear,
+    },
+    SlashCommand {
+        name: "/effort",
+        description: "Select the model's reasoning effort",
+        action: SlashAction::Effort,
+    },
+    SlashCommand {
+        name: "/model",
+        description: "Switch models for this session",
+        action: SlashAction::Model,
+    },
+    SlashCommand {
+        name: "/goal",
+        description: "Keep working autonomously until an objective is complete",
+        action: SlashAction::Goal,
+    },
+    SlashCommand {
+        name: "/loop",
+        description: "Run a prompt repeatedly on an interval",
+        action: SlashAction::Loop,
     },
     SlashCommand {
         name: "/permissions",
@@ -94,6 +118,12 @@ struct Pending {
     request: PermissionRequest,
 }
 
+#[derive(Clone, Copy)]
+enum SettingPicker {
+    Effort(usize),
+    Model(usize),
+}
+
 pub(crate) struct FrontendProjection {
     transcript: Transcript,
     composer: Composer,
@@ -104,16 +134,19 @@ pub(crate) struct FrontendProjection {
     elapsed: Duration,
     usage: Usage,
     scroll_up: usize,
+    provider: String,
     model: String,
     effort: Option<String>,
     cwd: String,
     context_window: Option<u64>,
+    max_output_tokens: u32,
     slash_selected: usize,
     history: Vec<String>,
     history_cursor: Option<usize>,
     history_draft: String,
     permission_mode: Mode,
     permissions_selected: Option<usize>,
+    setting_picker: Option<SettingPicker>,
     provider_change_notice: bool,
     last_request_usage: Usage,
     quit_armed_until: Option<Instant>,
@@ -122,10 +155,12 @@ pub(crate) struct FrontendProjection {
 
 impl FrontendProjection {
     pub(crate) fn new(
+        provider: String,
         model: String,
         effort: Option<String>,
         cwd: String,
         context_window: Option<u64>,
+        max_output_tokens: u32,
         permission_mode: Mode,
         history: Vec<String>,
     ) -> Self {
@@ -139,16 +174,19 @@ impl FrontendProjection {
             elapsed: Duration::ZERO,
             usage: Usage::default(),
             scroll_up: 0,
+            provider,
             model,
             effort,
             cwd,
             context_window,
+            max_output_tokens,
             slash_selected: 0,
             history,
             history_cursor: None,
             history_draft: String::new(),
             permission_mode,
             permissions_selected: None,
+            setting_picker: None,
             provider_change_notice: false,
             last_request_usage: Usage::default(),
             quit_armed_until: None,
@@ -166,6 +204,9 @@ impl FrontendProjection {
             return FrontendEffect::None;
         }
         if let Some(effect) = self.handle_permissions_key(key) {
+            return effect;
+        }
+        if let Some(effect) = self.handle_setting_key(key) {
             return effect;
         }
         if ctrl && key.code == KeyCode::Char('c') && self.interrupting {
@@ -237,6 +278,69 @@ impl FrontendProjection {
             }
             _ => Some(FrontendEffect::None),
         }
+    }
+
+    fn handle_setting_key(&mut self, key: KeyEvent) -> Option<FrontendEffect> {
+        let picker = self.setting_picker?;
+        let (selected, count) = match picker {
+            SettingPicker::Effort(selected) => (selected, self.effort_options().len()),
+            SettingPicker::Model(selected) => (selected, self.model_options().len()),
+        };
+        match key.code {
+            KeyCode::Up => {
+                self.setting_picker = Some(match picker {
+                    SettingPicker::Effort(_) => SettingPicker::Effort(selected.saturating_sub(1)),
+                    SettingPicker::Model(_) => SettingPicker::Model(selected.saturating_sub(1)),
+                });
+                Some(FrontendEffect::None)
+            }
+            KeyCode::Down => {
+                let selected = (selected + 1).min(count.saturating_sub(1));
+                self.setting_picker = Some(match picker {
+                    SettingPicker::Effort(_) => SettingPicker::Effort(selected),
+                    SettingPicker::Model(_) => SettingPicker::Model(selected),
+                });
+                Some(FrontendEffect::None)
+            }
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.setting_picker = None;
+                match picker {
+                    SettingPicker::Effort(selected) => {
+                        let effort = self.effort_options()[selected].to_owned();
+                        self.effort = Some(effort.clone());
+                        Some(FrontendEffect::Command(UiCommand::SetReasoningEffort(
+                            Some(effort),
+                        )))
+                    }
+                    SettingPicker::Model(selected) => {
+                        let model = self.model_options()[selected].to_owned();
+                        self.context_window =
+                            model_context_window(&self.provider, &model).map(|window| {
+                                context_before_compaction(
+                                    &self.provider,
+                                    window,
+                                    self.max_output_tokens,
+                                )
+                            });
+                        self.model = model.clone();
+                        Some(FrontendEffect::Command(UiCommand::SetModel(model)))
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                self.setting_picker = None;
+                Some(FrontendEffect::None)
+            }
+            _ => Some(FrontendEffect::None),
+        }
+    }
+
+    fn model_options(&self) -> &'static [&'static str] {
+        model_options(&self.provider)
+    }
+
+    fn effort_options(&self) -> &'static [&'static str] {
+        effort_options(&self.provider, &self.model)
     }
 
     fn handle_slash_key(&mut self, key: KeyEvent) -> Option<FrontendEffect> {
@@ -356,12 +460,14 @@ impl FrontendProjection {
                 self.scroll_down();
                 FrontendEffect::None
             }
-            KeyCode::Esc if self.running => {
+            KeyCode::Esc if self.running && self.composer.text().is_empty() => {
                 self.interrupting = true;
                 FrontendEffect::Command(UiCommand::Interrupt)
             }
             KeyCode::Esc => {
                 self.composer.clear();
+                self.leave_history();
+                self.slash_selected = 0;
                 FrontendEffect::None
             }
             KeyCode::Char(c) if !ctrl => {
@@ -439,6 +545,12 @@ impl FrontendProjection {
             .iter()
             .copied()
             .filter(|command| command.name.starts_with(query))
+            .filter(|command| {
+                !matches!(command.action, SlashAction::Effort) || !self.effort_options().is_empty()
+            })
+            .filter(|command| {
+                !matches!(command.action, SlashAction::Model) || !self.model_options().is_empty()
+            })
             .collect()
     }
 
@@ -459,7 +571,34 @@ impl FrontendProjection {
             SlashAction::Clear => {
                 self.transcript.clear();
                 self.scroll_up = 0;
+                self.last_request_usage = Usage::default();
                 FrontendEffect::Command(UiCommand::Clear)
+            }
+            SlashAction::Effort => {
+                let selected = self
+                    .effort_options()
+                    .iter()
+                    .position(|effort| Some(*effort) == self.effort.as_deref())
+                    .unwrap_or_default();
+                self.setting_picker = Some(SettingPicker::Effort(selected));
+                FrontendEffect::None
+            }
+            SlashAction::Model => {
+                let selected = self
+                    .model_options()
+                    .iter()
+                    .position(|model| *model == self.model)
+                    .unwrap_or_default();
+                self.setting_picker = Some(SettingPicker::Model(selected));
+                FrontendEffect::None
+            }
+            SlashAction::Goal => {
+                self.composer.replace("/goal ");
+                FrontendEffect::None
+            }
+            SlashAction::Loop => {
+                self.composer.replace("/loop ");
+                FrontendEffect::None
             }
             SlashAction::Permissions => {
                 self.permissions_selected = Some(
@@ -485,6 +624,15 @@ impl FrontendProjection {
             return FrontendEffect::None;
         }
         let message = trimmed.to_owned();
+        if let Some(command) = parse_autonomy_command(&message) {
+            self.transcript.push_user(message.clone());
+            self.scroll_up = 0;
+            if self.history.last() != Some(&message) {
+                self.history.push(message);
+            }
+            self.leave_history();
+            return FrontendEffect::Command(command);
+        }
         if self.history.last() != Some(&message) {
             self.history.push(message.clone());
         }
@@ -554,13 +702,18 @@ impl FrontendProjection {
     }
 
     pub(crate) fn permissions_panel_height(&self) -> u16 {
-        if self.permissions_selected.is_some() {
-            u16::try_from(PERMISSION_MODES.len())
-                .unwrap_or(u16::MAX)
-                .saturating_add(2)
+        let count = if self.permissions_selected.is_some() {
+            PERMISSION_MODES.len()
         } else {
-            0
-        }
+            match self.setting_picker {
+                Some(SettingPicker::Effort(_)) => self.effort_options().len(),
+                Some(SettingPicker::Model(_)) => self.model_options().len(),
+                None => 0,
+            }
+        };
+        u16::try_from(count)
+            .unwrap_or(u16::MAX)
+            .saturating_add(u16::from(count > 0) * 2)
     }
 
     pub(crate) fn show_provider_change_notice(&mut self) {
@@ -602,6 +755,10 @@ impl FrontendProjection {
     }
 
     pub(crate) fn render_permissions_panel(&self, frame: &mut Frame, area: Rect) {
+        if let Some(picker) = self.setting_picker {
+            self.render_setting_picker(frame, area, picker);
+            return;
+        }
         let Some(selected) = self.permissions_selected else {
             return;
         };
@@ -622,6 +779,47 @@ impl FrontendProjection {
                     Span::styled(active, theme::running()),
                     Span::styled(format!("{:<12}", option.name), style),
                     Span::styled(option.description, theme::picker_muted()),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let inner = Rect {
+            x: area.x,
+            y: area.y.saturating_add(1),
+            width: area.width,
+            height: area.height.saturating_sub(2),
+        };
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_setting_picker(&self, frame: &mut Frame, area: Rect, picker: SettingPicker) {
+        let (options, selected, active) = match picker {
+            SettingPicker::Effort(selected) => {
+                (self.effort_options(), selected, self.effort.as_deref())
+            }
+            SettingPicker::Model(selected) => {
+                (self.model_options(), selected, Some(self.model.as_str()))
+            }
+        };
+        frame.render_widget(Block::default().style(theme::picker_bg()), area);
+        let lines = options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                let marker = if index == selected { "› " } else { "  " };
+                let current = if active == Some(*option) {
+                    "● "
+                } else {
+                    "  "
+                };
+                let style = if index == selected {
+                    theme::picker_selected()
+                } else {
+                    theme::picker_muted()
+                };
+                Line::from(vec![
+                    Span::styled(marker, style),
+                    Span::styled(current, theme::running()),
+                    Span::styled(*option, style),
                 ])
             })
             .collect::<Vec<_>>();
@@ -664,6 +862,7 @@ impl FrontendProjection {
 
     pub(crate) fn apply(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::AutomaticTurnStarted(_) => self.begin_automatic_turn(),
             AgentEvent::TextDelta(text) => self.transcript.text_delta(&text),
             AgentEvent::ThinkingDelta(text) => self.transcript.thinking_delta(&text),
             AgentEvent::ToolStarted { id, name, summary } => {
@@ -704,6 +903,10 @@ impl FrontendProjection {
 
     pub(crate) fn begin_turn(&mut self, text: &str) {
         self.transcript.push_user(text.to_owned());
+        self.begin_automatic_turn();
+    }
+
+    fn begin_automatic_turn(&mut self) {
         self.scroll_up = 0;
         self.running = true;
         self.interrupting = false;
@@ -828,6 +1031,52 @@ impl FrontendProjection {
     }
 }
 
+fn parse_autonomy_command(input: &str) -> Option<UiCommand> {
+    if let Some(rest) = input
+        .strip_prefix("/goal")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        let argument = rest.trim();
+        return match argument {
+            "" => None,
+            "clear" | "cancel" => Some(UiCommand::SetGoal(None)),
+            "pause" => Some(UiCommand::PauseGoal),
+            "resume" => Some(UiCommand::ResumeGoal),
+            objective => Some(UiCommand::SetGoal(Some(objective.to_owned()))),
+        };
+    }
+    if let Some(rest) = input
+        .strip_prefix("/loop")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        let argument = rest.trim();
+        if matches!(argument, "cancel" | "clear" | "stop") {
+            return Some(UiCommand::SetLoop(None));
+        }
+        let (interval, prompt) = argument.split_once(char::is_whitespace)?;
+        let interval = parse_loop_duration(interval)?;
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return None;
+        }
+        return Some(UiCommand::SetLoop(Some((interval, prompt.to_owned()))));
+    }
+    None
+}
+
+fn parse_loop_duration(input: &str) -> Option<Duration> {
+    let split = input.find(|character: char| !character.is_ascii_digit())?;
+    let (amount, unit) = input.split_at(split);
+    let amount = amount.parse::<u64>().ok()?;
+    let seconds = match unit {
+        "s" => amount,
+        "m" => amount.checked_mul(60)?,
+        "h" => amount.checked_mul(60 * 60)?,
+        _ => return None,
+    };
+    (seconds >= 10).then(|| Duration::from_secs(seconds))
+}
+
 fn working_indicator_line(elapsed: Duration, interrupting: bool) -> Line<'static> {
     let elapsed = format!("{}s", elapsed.as_secs());
     let (activity, hint) = if interrupting {
@@ -840,6 +1089,67 @@ fn working_indicator_line(elapsed: Duration, interrupting: bool) -> Line<'static
         Span::styled(activity, theme::bold()),
         Span::styled(format!(" ({elapsed} • {hint})"), theme::dim()),
     ])
+}
+
+fn model_options(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "anthropic" => &[
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+        ],
+        "openai" => &[
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.2",
+        ],
+        "deepseek" => &[
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "deepseek-chat",
+            "deepseek-reasoner",
+        ],
+        _ => &[],
+    }
+}
+
+fn model_context_window(provider: &str, model: &str) -> Option<u64> {
+    match provider {
+        "anthropic" if model.contains("haiku") => Some(200_000),
+        "anthropic" => Some(1_000_000),
+        "openai" if model.starts_with("gpt-5.6") => Some(372_000),
+        "openai" if model == "gpt-5.4" => Some(1_000_000),
+        "openai" => Some(272_000),
+        "deepseek" => Some(1_000_000),
+        _ => None,
+    }
+}
+
+fn context_before_compaction(provider: &str, window: u64, max_output_tokens: u32) -> u64 {
+    if provider == "openai" {
+        window.saturating_mul(9) / 10
+    } else {
+        window.saturating_sub(u64::from(max_output_tokens).min(20_000))
+    }
+}
+
+fn effort_options(provider: &str, model: &str) -> &'static [&'static str] {
+    match provider {
+        "anthropic" if model == "claude-haiku-4-5" => &[],
+        "anthropic" => &["low", "medium", "high", "xhigh", "max"],
+        "openai" if model == "gpt-5.6-sol" || model == "gpt-5.6-terra" => {
+            &["low", "medium", "high", "xhigh", "max", "ultra"]
+        }
+        "openai" if model == "gpt-5.6-luna" => &["low", "medium", "high", "xhigh", "max"],
+        "openai" => &["low", "medium", "high", "xhigh"],
+        "deepseek" => &["high", "max"],
+        _ => &[],
+    }
 }
 
 fn slash_command_name_width() -> usize {
@@ -1119,9 +1429,11 @@ mod tests {
     fn projection() -> FrontendProjection {
         FrontendProjection::new(
             String::new(),
+            String::new(),
             None,
             String::new(),
             None,
+            0,
             Mode::Suggest,
             Vec::new(),
         )
@@ -1300,6 +1612,18 @@ mod tests {
         );
         assert_eq!(context_meter(Some(100_000), 0, false), "ctx ──────── 0%");
         assert_eq!(context_meter(None, 10, true), "context ──────── N/A");
+        assert_eq!(
+            context_before_compaction("openai", 372_000, 32_000),
+            334_800
+        );
+        assert_eq!(
+            context_before_compaction("anthropic", 1_000_000, 32_000),
+            980_000
+        );
+        assert_eq!(
+            context_meter(Some(334_800), 334_800, true),
+            "context ━━━━━━━━ 100%"
+        );
     }
 
     #[test]
@@ -1329,8 +1653,8 @@ mod tests {
     fn slash_picker_filters_and_runs_commands() {
         let mut projection = projection();
         projection.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        assert_eq!(projection.slash_matches().len(), 3);
-        assert_eq!(projection.slash_picker_height(), 5);
+        assert_eq!(projection.slash_matches().len(), 5);
+        assert_eq!(projection.slash_picker_height(), 7);
         assert!(
             projection
                 .slash_matches()
@@ -1345,6 +1669,64 @@ mod tests {
             FrontendEffect::Command(UiCommand::Clear)
         ));
         assert_eq!(projection.slash_picker_height(), 0);
+    }
+
+    #[test]
+    fn clear_resets_context_meter_usage() {
+        let mut projection = projection();
+        projection.context_window = Some(100_000);
+        projection.apply(AgentEvent::RequestUsage(Usage {
+            input_tokens: 62_000,
+            ..Usage::default()
+        }));
+        assert_eq!(
+            footer_status(
+                "",
+                80,
+                projection.context_window,
+                projection.last_request_usage.input_tokens,
+            ),
+            "context ━━━━━─── 62%"
+        );
+
+        projection.composer.replace("/clear");
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            FrontendEffect::Command(UiCommand::Clear)
+        ));
+
+        assert_eq!(projection.last_request_usage, Usage::default());
+        assert_eq!(
+            footer_status(
+                "",
+                80,
+                projection.context_window,
+                projection.last_request_usage.input_tokens,
+            ),
+            "context ──────── 0%"
+        );
+    }
+
+    #[test]
+    fn autonomy_commands_parse_goal_and_loop_controls() {
+        assert!(matches!(
+            parse_autonomy_command("/goal finish the migration"),
+            Some(UiCommand::SetGoal(Some(objective))) if objective == "finish the migration"
+        ));
+        assert!(matches!(
+            parse_autonomy_command("/goal pause"),
+            Some(UiCommand::PauseGoal)
+        ));
+        assert!(matches!(
+            parse_autonomy_command("/loop 5m check the deploy"),
+            Some(UiCommand::SetLoop(Some((interval, prompt))))
+                if interval == Duration::from_secs(300) && prompt == "check the deploy"
+        ));
+        assert!(matches!(
+            parse_autonomy_command("/loop cancel"),
+            Some(UiCommand::SetLoop(None))
+        ));
+        assert!(parse_autonomy_command("/loop 2s too fast").is_none());
     }
 
     #[test]
@@ -1371,6 +1753,108 @@ mod tests {
             permission_mode_indicator(Mode::AutoEdit, Mode::Suggest),
             "  "
         );
+    }
+
+    #[test]
+    fn model_command_selects_a_new_model() {
+        let mut projection = projection();
+        projection.provider = "openai".into();
+        projection.model = "gpt-5.6-sol".into();
+        projection.composer.replace("/model");
+
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            FrontendEffect::None
+        ));
+        projection.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            FrontendEffect::Command(UiCommand::SetModel(model)) if model == "gpt-5.6-terra"
+        ));
+        assert_eq!(projection.model, "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn provider_model_and_effort_options_match_the_api_catalogs() {
+        assert_eq!(
+            model_options("anthropic"),
+            &[
+                "claude-fable-5",
+                "claude-opus-4-8",
+                "claude-sonnet-5",
+                "claude-haiku-4-5",
+            ]
+        );
+        assert_eq!(
+            effort_options("anthropic", "claude-fable-5"),
+            &["low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(effort_options("anthropic", "claude-haiku-4-5").is_empty());
+
+        assert_eq!(
+            model_options("openai"),
+            &[
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.2",
+            ]
+        );
+        assert_eq!(
+            effort_options("openai", "gpt-5.6-sol"),
+            &["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            effort_options("openai", "gpt-5.6-luna"),
+            &["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            effort_options("openai", "gpt-5.5"),
+            &["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(model_context_window("openai", "gpt-5.6-sol"), Some(372_000));
+        assert_eq!(model_context_window("openai", "gpt-5.4"), Some(1_000_000));
+        assert_eq!(
+            model_context_window("openai", "gpt-5.4-mini"),
+            Some(272_000)
+        );
+
+        assert_eq!(
+            model_options("deepseek"),
+            &[
+                "deepseek-v4-flash",
+                "deepseek-v4-pro",
+                "deepseek-chat",
+                "deepseek-reasoner",
+            ]
+        );
+        assert_eq!(
+            effort_options("deepseek", "deepseek-v4-pro"),
+            &["high", "max"]
+        );
+    }
+
+    #[test]
+    fn effort_command_is_only_available_for_supported_models() {
+        let mut projection = projection();
+        projection.provider = "anthropic".into();
+        projection.model = "claude-haiku-4-5".into();
+        projection.composer.replace("/effort");
+        assert!(projection.slash_matches().is_empty());
+
+        projection.provider = "deepseek".into();
+        projection.model = "deepseek-v4-pro".into();
+        projection.effort = Some("high".into());
+        assert_eq!(projection.slash_matches().len(), 1);
+        projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        projection.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            FrontendEffect::Command(UiCommand::SetReasoningEffort(Some(effort))) if effort == "max"
+        ));
     }
 
     #[test]
@@ -1440,6 +1924,26 @@ mod tests {
     }
 
     #[test]
+    fn escape_clears_a_running_draft_before_interrupting() {
+        let mut projection = projection();
+        projection.running = true;
+        projection.composer.replace("queued follow-up");
+
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            FrontendEffect::None
+        ));
+        assert!(projection.composer.text().is_empty());
+        assert!(!projection.interrupting);
+
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            FrontendEffect::Command(UiCommand::Interrupt)
+        ));
+        assert!(projection.interrupting);
+    }
+
+    #[test]
     fn escape_dismisses_provider_notice_and_continues_to_picker() {
         let mut projection = projection();
         projection.running = true;
@@ -1486,9 +1990,11 @@ mod tests {
     fn up_arrow_recalls_history_loaded_from_a_previous_session() {
         let mut projection = FrontendProjection::new(
             String::new(),
+            String::new(),
             None,
             String::new(),
             None,
+            0,
             Mode::Suggest,
             vec![
                 "from another directory".to_owned(),

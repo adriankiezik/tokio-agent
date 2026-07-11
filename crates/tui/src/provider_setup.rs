@@ -23,7 +23,7 @@ struct ProviderOption {
     default_model: &'static str,
 }
 
-const OPTIONS: [ProviderOption; 3] = [
+const OPTIONS: [ProviderOption; 4] = [
     ProviderOption {
         name: "ChatGPT subscription",
         provider: ProviderKind::OpenAi,
@@ -42,7 +42,29 @@ const OPTIONS: [ProviderOption; 3] = [
         auth: AuthKind::ApiKey,
         default_model: "claude-sonnet-5",
     },
+    ProviderOption {
+        name: "DeepSeek API key",
+        provider: ProviderKind::DeepSeek,
+        auth: AuthKind::ApiKey,
+        default_model: "deepseek-v4-flash",
+    },
 ];
+
+fn settings_for_provider(
+    option: ProviderOption,
+    active_provider: Option<ProviderKind>,
+    active_model: Option<&str>,
+    active_effort: Option<&str>,
+) -> (String, Option<String>) {
+    if active_provider == Some(option.provider) {
+        (
+            active_model.unwrap_or(option.default_model).to_owned(),
+            active_effort.map(str::to_owned),
+        )
+    } else {
+        (option.default_model.to_owned(), None)
+    }
+}
 
 enum Screen {
     Providers,
@@ -54,7 +76,9 @@ struct Setup {
     selected: usize,
     screen: Screen,
     active: Option<(ProviderKind, AuthKind)>,
-    connected: [bool; 3],
+    active_model: Option<String>,
+    active_effort: Option<String>,
+    connected: [bool; 4],
     message: Option<(String, bool)>,
 }
 
@@ -92,13 +116,15 @@ fn configure_provider_on(
     let config = Config::load(cwd)
         .ok()
         .and_then(|config| config.resolve().ok());
-    let active = config.map(|config| {
+    let active = config.as_ref().map(|config| {
         let auth = config.auth.unwrap_or_else(|| match config.provider {
             ProviderKind::OpenAi if tokio_agent_auth::is_signed_in() => AuthKind::ChatGpt,
             _ => AuthKind::ApiKey,
         });
         (config.provider, auth)
     });
+    let active_model = config.as_ref().map(|config| config.model.clone());
+    let active_effort = config.and_then(|config| config.reasoning_effort);
     let mut setup = Setup {
         selected: active
             .and_then(|active| {
@@ -109,10 +135,13 @@ fn configure_provider_on(
             .unwrap_or(0),
         screen: Screen::Providers,
         active,
+        active_model,
+        active_effort,
         connected: [
             tokio_agent_auth::is_signed_in(),
             tokio_agent_config::api_key("openai").is_ok(),
             tokio_agent_config::api_key("anthropic").is_ok(),
+            tokio_agent_config::api_key("deepseek").is_ok(),
         ],
         message: None,
     };
@@ -266,13 +295,22 @@ impl Setup {
     }
 
     fn activate(&mut self, option: ProviderOption) -> Result<(), String> {
+        let (model, effort) = settings_for_provider(
+            option,
+            self.active.map(|(provider, _)| provider),
+            self.active_model.as_deref(),
+            self.active_effort.as_deref(),
+        );
         tokio_agent_config::store_provider_selection(
             option.provider,
             option.auth,
-            option.default_model,
+            &model,
+            effort.as_deref(),
         )
         .map_err(|error| error.to_string())?;
         self.active = Some((option.provider, option.auth));
+        self.active_model = Some(model);
+        self.active_effort = effort;
         Ok(())
     }
 
@@ -401,5 +439,36 @@ fn inset(area: Rect, horizontal: u16, vertical: u16) -> Rect {
         y: area.y.saturating_add(vertical),
         width: area.width.saturating_sub(horizontal.saturating_mul(2)),
         height: area.height.saturating_sub(vertical.saturating_mul(2)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_provider_retains_model_and_effort() {
+        let option = OPTIONS[0];
+        let settings = settings_for_provider(
+            option,
+            Some(ProviderKind::OpenAi),
+            Some("gpt-5.6-terra"),
+            Some("max"),
+        );
+
+        assert_eq!(settings, ("gpt-5.6-terra".into(), Some("max".into())));
+    }
+
+    #[test]
+    fn different_provider_uses_default_model_and_clears_effort() {
+        let option = OPTIONS[2];
+        let settings = settings_for_provider(
+            option,
+            Some(ProviderKind::OpenAi),
+            Some("gpt-5.6-terra"),
+            Some("max"),
+        );
+
+        assert_eq!(settings, ("claude-sonnet-5".into(), None));
     }
 }

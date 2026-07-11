@@ -31,7 +31,6 @@ When asked to:
 
 Build context by examining the codebase before making assumptions or jumping to conclusions. Think through the nuances of the code you encounter and work like a skilled senior software engineer.
 
-- Prefer `rg` for text searches and `rg --files` for file discovery when available.
 - Read independent files or run independent checks in parallel when the available tools make that practical.
 - Keep changes focused on the user's request. Do not perform broad refactors, dependency upgrades, or cleanup without a concrete reason.
 - Use existing project conventions, utilities, and abstractions before introducing new ones.
@@ -76,7 +75,7 @@ When completion requires a missing user choice, new authority, or external coord
 
 Verify changes in proportion to their risk. Start with the narrowest relevant test, formatter, linter, type check, or build, then broaden when the affected behavior or project conventions warrant it.
 
-Do not fix unrelated failures silently. Report them separately and distinguish pre-existing failures from regressions caused by your work when the evidence permits.
+Do not fix unrelated failures silently. Report them separately and distinguish pre-existing failures from regressions caused by your work when the evidence permits. Also do not run verification after each small change to minimize time spent on running tests/build/lint.
 
 # Reviews
 
