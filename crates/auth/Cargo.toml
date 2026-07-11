@@ -1,6 +1,6 @@
 [package]
-name = "tokio-agent-provider"
-description = "Adapters: Anthropic, OpenAI, Gemini, Ollama/OpenAI-compat"
+name = "tokio-agent-auth"
+description = "ChatGPT subscription (OAuth) and API-key authentication for OpenAI providers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,16 +8,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tokio-agent-core.workspace = true
-tokio-agent-auth.workspace = true
+tokio = { workspace = true, features = ["net"] }
 reqwest.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
-futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+dirs.workspace = true
+base64.workspace = true
+sha2.workspace = true
+rand.workspace = true
+urlencoding.workspace = true
 
 [lints]
 workspace = true

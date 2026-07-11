@@ -13,6 +13,7 @@ tokio-agent-provider.workspace = true
 tokio-agent-tools.workspace = true
 tokio-agent-tui.workspace = true
 tokio-agent-config.workspace = true
+tokio-agent-auth.workspace = true
 tokio-agent-mcp.workspace = true
 tokio-agent-plugin.workspace = true
 clap.workspace = true

@@ -6,6 +6,7 @@ members = [
     "crates/tools",
     "crates/tui",
     "crates/config",
+    "crates/auth",
     "crates/mcp",
     "crates/plugin",
     "crates/cli",
@@ -24,6 +25,7 @@ tokio-agent-provider = { path = "crates/provider" }
 tokio-agent-tools = { path = "crates/tools" }
 tokio-agent-tui = { path = "crates/tui" }
 tokio-agent-config = { path = "crates/config" }
+tokio-agent-auth = { path = "crates/auth" }
 tokio-agent-mcp = { path = "crates/mcp" }
 tokio-agent-plugin = { path = "crates/plugin" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "time", "signal"] }
@@ -35,9 +37,16 @@ toml = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 ratatui = "0.30"
 crossterm = "0.29"
+terminal-colorsaurus = "1"
 pulldown-cmark = "0.13"
 syntect = "5"
+two-face = "0.5"
 similar = "2"
+globset = "0.4"
+ignore = "0.4"
+regex = "1"
+unicode-segmentation = "1"
+unicode-width = "0.2"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
@@ -45,6 +54,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
 dirs = "6"
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.9"
+urlencoding = "2"
+nix = { version = "0.30", features = ["signal"] }
 insta = "1"
 
 [workspace.lints.rust]

@@ -1,0 +1,26 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_abc"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"I should read the file before editing it."}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"I should read the file before editing it."}],"encrypted_content":"EqMBCkYIBRgCKkDsig5o0BqNZQz7hOxc9K8AF2i1EhIvSnr3jY0mPqXW4wcT2LZUdBM6VvE1kAaGwRj0nC7yhIiaAlFvbxxJ2u9FEgxOe6nQhAo4rC1qkc0aDA=="}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_h7q1nZ8sVxLmT2","name":"read","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"path\":\"src/ma"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"in.rs\",\"limit\":2000}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_h7q1nZ8sVxLmT2","name":"read","arguments":"{\"path\":\"src/main.rs\",\"limit\":2000}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_abc","usage":{"input_tokens":472,"input_tokens_details":{"cached_tokens":128},"output_tokens":89,"output_tokens_details":{"reasoning_tokens":64}}}}

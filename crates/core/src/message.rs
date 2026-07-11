@@ -1,10 +1,29 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 pub type ProviderName = String;
 
-pub type ProviderMetadata = BTreeMap<ProviderName, Box<serde_json::value::RawValue>>;
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProviderMetadata(BTreeMap<ProviderName, Box<RawValue>>);
+
+impl ProviderMetadata {
+    pub fn get(&self, provider: &str) -> Option<&RawValue> {
+        self.0.get(provider).map(Box::as_ref)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn from_provider(provider: ProviderName, raw: Box<RawValue>) -> Self {
+        Self(BTreeMap::from([(provider, raw)]))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -33,32 +52,42 @@ pub enum ToolOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
+#[serde(rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
         text: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "ProviderMetadata::is_empty")]
         meta: ProviderMetadata,
     },
     Thinking {
         text: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "ProviderMetadata::is_empty")]
         meta: ProviderMetadata,
     },
     ToolCall {
         id: ToolCallId,
         name: String,
-        args: serde_json::Value,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        args: Box<RawValue>,
+        #[serde(default, skip_serializing_if = "ProviderMetadata::is_empty")]
         meta: ProviderMetadata,
     },
     ToolResult {
         call: ToolCallId,
         output: ToolOutput,
         is_error: bool,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "ProviderMetadata::is_empty")]
         meta: ProviderMetadata,
     },
+}
+
+impl ContentBlock {
+    #[must_use]
+    pub fn parsed_args(&self) -> Option<Result<serde_json::Value, serde_json::Error>> {
+        match self {
+            ContentBlock::ToolCall { args, .. } => Some(serde_json::from_str(args.get())),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

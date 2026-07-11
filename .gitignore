@@ -5,3 +5,4 @@
 /docs/
 *.md
 !README.md
+!crates/cli/src/default_system_prompt.md

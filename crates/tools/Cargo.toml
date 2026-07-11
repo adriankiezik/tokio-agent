@@ -1,6 +1,6 @@
 [package]
 name = "tokio-agent-tools"
-description = "Built-in Tools: read, write, edit, multi-edit, bash, glob, grep"
+description = "Built-in Tools: read, write, edit, multi-edit, bash, glob, grep, web search"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,11 +9,19 @@ repository.workspace = true
 
 [dependencies]
 tokio-agent-core.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+globset.workspace = true
+ignore.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
 
 [lints]
 workspace = true
