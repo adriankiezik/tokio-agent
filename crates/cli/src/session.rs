@@ -253,12 +253,10 @@ fn load_prompt_commands(
         let root = resolve_extension_root(cwd, &id, &user, &project)?
             .with_context(|| format!("enabled extension `{id}` is not installed or linked"))?;
         let manifest = tokio_agent_plugin::validate_package(&root, &semver::Version::new(1, 0, 0))?;
-        if manifest.id.starts_with("tokio.official.")
+        if manifest.id.starts_with("tokio.")
             && (project.linked.contains_key(&id) || user.linked.contains_key(&id))
         {
-            anyhow::bail!(
-                "the `tokio.official.*` namespace is reserved for the built-in official registry"
-            );
+            anyhow::bail!("the `tokio.*` namespace is reserved for the built-in official registry");
         }
         if manifest.id != id {
             anyhow::bail!(

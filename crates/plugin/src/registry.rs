@@ -267,7 +267,7 @@ fn validate_index(index: &RegistryIndex, trust: &RegistryTrust) -> Result<(), Re
         {
             return Err(RegistryError::Compatibility);
         }
-        if package.id.starts_with("tokio.official.") && !matches!(trust, RegistryTrust::Official) {
+        if package.id.starts_with("tokio.") && !matches!(trust, RegistryTrust::Official) {
             return Err(RegistryError::Identity);
         }
     }

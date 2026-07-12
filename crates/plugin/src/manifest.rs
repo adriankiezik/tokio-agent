@@ -303,7 +303,7 @@ pub fn validate_package(
 }
 
 fn validate_id(id: &str) -> Result<(), ManifestError> {
-    let valid = id.len() <= 128 && id.split('.').count() >= 3 && id.split('.').all(is_name);
+    let valid = id.len() <= 128 && id.split('.').count() >= 2 && id.split('.').all(is_name);
     if valid {
         Ok(())
     } else {
@@ -350,4 +350,16 @@ fn validate_relative(value: &str) -> Result<(), ManifestError> {
 }
 fn normalize_requirement(value: &str) -> String {
     value.replace(", <", ",<").replace(", >", ",>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_id;
+
+    #[test]
+    fn accepts_two_part_extension_ids() {
+        assert!(validate_id("tokio.goal").is_ok());
+        assert!(validate_id("tokio.loop").is_ok());
+        assert!(validate_id("goal").is_err());
+    }
 }

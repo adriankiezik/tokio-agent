@@ -110,7 +110,7 @@ fn persist(state: &State) -> Vec<u8> {
 
 fn tool() -> ToolDescriptor {
     ToolDescriptor {
-        id: ToolId::new("tokio.official.goal:update_goal"),
+        id: ToolId::new("tokio.goal:update_goal"),
         name: "update_goal".into(),
         description: "Mark the active goal complete or blocked".into(),
         input_schema: serde_json::json!({
@@ -118,13 +118,13 @@ fn tool() -> ToolDescriptor {
             "properties": { "status": { "type": "string", "enum": ["complete", "blocked"] } },
             "required": ["status"], "additionalProperties": false
         }),
-        owner: ExtensionId::new("tokio.official.goal"),
+        owner: ExtensionId::new("tokio.goal"),
         permission: tokio_agent_extension_api::ToolPermission::Read,
     }
 }
 fn deactivate(text: &str) -> Vec<ExtensionAction> {
     vec![
-        ExtensionAction::UnregisterTool(ToolId::new("tokio.official.goal:update_goal")),
+        ExtensionAction::UnregisterTool(ToolId::new("tokio.goal:update_goal")),
         ExtensionAction::SetStatusSegment(status(text)),
         ExtensionAction::PersistSessionState(Vec::new()),
         ExtensionAction::ReleaseAutonomy,

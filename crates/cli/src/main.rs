@@ -260,10 +260,8 @@ fn run_extension(command: ExtensionCommand) -> anyhow::Result<()> {
         ExtensionCommand::Link(args) => {
             let manifest =
                 tokio_agent_plugin::validate_package(&args.path, &semver::Version::new(1, 0, 0))?;
-            if manifest.id.starts_with("tokio.official.") {
-                anyhow::bail!(
-                    "the `tokio.official.*` namespace is reserved for official registry packages"
-                );
+            if manifest.id.starts_with("tokio.") {
+                anyhow::bail!("the `tokio.*` namespace is reserved for official registry packages");
             }
             let capabilities = manifest.capabilities.as_set();
             if !capabilities.is_empty() && !args.approve {
