@@ -138,6 +138,7 @@ pub enum ExtensionAction {
     Steer { text: String },
     ShowNotice { level: NoticeLevel, text: String },
     SetStatusSegment(StatusSegment),
+    ClearStatusSegment(String),
     RegisterTool(ToolDescriptor),
     UnregisterTool(ToolId),
     ScheduleTimer { id: TimerId, after: DurationDto },
@@ -235,7 +236,8 @@ pub struct ExtensionSummary {
     pub description: String,
     pub origin: ExtensionOrigin,
     pub installed: bool,
-    pub enabled: bool,
+    #[serde(default)]
+    pub local_override: bool,
     #[serde(default)]
     pub capabilities: Vec<Capability>,
     #[serde(default)]

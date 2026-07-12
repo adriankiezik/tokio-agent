@@ -4,30 +4,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtensionScope {
-    User,
-    Project,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Enablement {
-    Enabled,
-    Disabled,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResolvedEnablement {
-    pub enabled: bool,
-    pub source: Option<ExtensionScope>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionConfig {
-    #[serde(default)]
-    pub extensions: BTreeMap<String, Enablement>,
+    #[serde(default, rename = "extensions", skip_serializing)]
+    legacy_enablement: BTreeMap<String, String>,
     #[serde(default)]
     pub linked: BTreeMap<String, PathBuf>,
     #[serde(default)]
@@ -88,30 +69,6 @@ impl ExtensionConfig {
     }
 
     #[must_use]
-    pub fn resolve(id: &str, user: &Self, project: &Self) -> ResolvedEnablement {
-        if let Some(value) = project.extensions.get(id) {
-            return ResolvedEnablement {
-                enabled: *value == Enablement::Enabled,
-                source: Some(ExtensionScope::Project),
-            };
-        }
-        if let Some(value) = user.extensions.get(id) {
-            return ResolvedEnablement {
-                enabled: *value == Enablement::Enabled,
-                source: Some(ExtensionScope::User),
-            };
-        }
-        ResolvedEnablement {
-            enabled: false,
-            source: None,
-        }
-    }
-
-    pub fn set(&mut self, id: impl Into<String>, enablement: Enablement) {
-        self.extensions.insert(id.into(), enablement);
-    }
-
-    #[must_use]
     pub fn grant_matches(&self, requested: &CapabilityGrant) -> bool {
         self.capability_grants
             .iter()
@@ -156,4 +113,27 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExtensionConfig;
+
+    #[test]
+    fn legacy_enablement_is_ignored_and_removed_when_saved() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("extensions.toml");
+        std::fs::write(
+            &path,
+            "[extensions]\n\"example.extension\" = \"disabled\"\n",
+        )
+        .unwrap();
+
+        let config = ExtensionConfig::load(&path).unwrap();
+        config.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(!saved.contains("extensions"));
+        assert!(!saved.contains("disabled"));
+    }
 }

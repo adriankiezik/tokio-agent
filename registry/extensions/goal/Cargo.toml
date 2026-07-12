@@ -1,6 +1,6 @@
 [package]
-name = "tokio-agent-official-goal"
-version = "1.0.0"
+name = "tokio-goal"
+version = "1.0.1"
 edition = "2024"
 license = "MIT"
 publish = false

@@ -3,10 +3,4 @@
 **/*.rs.bk
 .DS_Store
 .tokio-agent/
-/docs/
-*.md
-!README.md
-!goal-loop-analysis.md
-!extension-system-design.md
-!crates/cli/src/default_system_prompt.md
-!registry/**/*.md
+registry/extensions/*/component/

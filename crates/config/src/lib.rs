@@ -8,6 +8,8 @@ const DEFAULT_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 const DEFAULT_REASONING_EFFORT: &str = "medium";
 const DEFAULT_PERMISSION_MODE: &str = "suggest";
+const DEFAULT_BASH_YIELD_TIME_MS: u64 = 10_000;
+const DEFAULT_BASH_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
 const MAX_RECENT_MESSAGES: usize = 100;
 
 static API_KEY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -42,6 +44,8 @@ pub enum ConfigError {
     UnknownAuth(String),
     #[error("unknown permission_mode '{0}'")]
     UnknownPermissionMode(String),
+    #[error("bash_timeout_ms must be greater than zero")]
+    InvalidBashTimeout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +101,8 @@ pub struct ResolvedConfig {
     pub reasoning_effort: Option<String>,
     pub permission_mode: PermissionMode,
     pub system_prompt: Option<String>,
+    pub bash_yield_time_ms: u64,
+    pub bash_timeout_ms: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -111,6 +117,8 @@ struct Layer {
     reasoning_effort: Option<String>,
     permission_mode: Option<String>,
     system_prompt: Option<String>,
+    bash_yield_time_ms: Option<u64>,
+    bash_timeout_ms: Option<u64>,
 }
 
 impl Layer {
@@ -142,6 +150,12 @@ impl Layer {
         if other.system_prompt.is_some() {
             self.system_prompt = other.system_prompt;
         }
+        if other.bash_yield_time_ms.is_some() {
+            self.bash_yield_time_ms = other.bash_yield_time_ms;
+        }
+        if other.bash_timeout_ms.is_some() {
+            self.bash_timeout_ms = other.bash_timeout_ms;
+        }
     }
 }
 
@@ -156,6 +170,8 @@ pub struct Config {
     pub reasoning_effort: Option<String>,
     pub permission_mode: String,
     pub system_prompt: Option<String>,
+    pub bash_yield_time_ms: u64,
+    pub bash_timeout_ms: u64,
 }
 
 impl Config {
@@ -205,6 +221,10 @@ impl Config {
                 .permission_mode
                 .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_owned()),
             system_prompt: layer.system_prompt,
+            bash_yield_time_ms: layer
+                .bash_yield_time_ms
+                .unwrap_or(DEFAULT_BASH_YIELD_TIME_MS),
+            bash_timeout_ms: layer.bash_timeout_ms.unwrap_or(DEFAULT_BASH_TIMEOUT_MS),
         }
     }
 
@@ -213,6 +233,9 @@ impl Config {
     }
 
     pub fn resolve(self) -> Result<ResolvedConfig, ConfigError> {
+        if self.bash_timeout_ms == 0 {
+            return Err(ConfigError::InvalidBashTimeout);
+        }
         let provider = match self.provider.as_str() {
             "anthropic" => ProviderKind::Anthropic,
             "openai" => ProviderKind::OpenAi,
@@ -247,6 +270,8 @@ impl Config {
             ),
             permission_mode,
             system_prompt: self.system_prompt,
+            bash_yield_time_ms: self.bash_yield_time_ms.clamp(250, 30_000),
+            bash_timeout_ms: self.bash_timeout_ms,
         })
     }
 }
@@ -675,6 +700,8 @@ mod tests {
             reasoning_effort: None,
             permission_mode: "auto-edit".into(),
             system_prompt: None,
+            bash_yield_time_ms: DEFAULT_BASH_YIELD_TIME_MS,
+            bash_timeout_ms: DEFAULT_BASH_TIMEOUT_MS,
         };
         let resolved = config.resolve().unwrap();
         assert_eq!(resolved.provider, ProviderKind::OpenAi);
@@ -692,6 +719,28 @@ mod tests {
         assert!(matches!(
             config.resolve(),
             Err(ConfigError::UnknownProvider(name)) if name == "unknown"
+        ));
+    }
+
+    #[test]
+    fn resolves_bash_runtime_limits() {
+        let resolved = Config {
+            bash_yield_time_ms: 120_000,
+            bash_timeout_ms: 90_000,
+            ..Config::default()
+        }
+        .resolve()
+        .unwrap();
+        assert_eq!(resolved.bash_yield_time_ms, 30_000);
+        assert_eq!(resolved.bash_timeout_ms, 90_000);
+
+        assert!(matches!(
+            Config {
+                bash_timeout_ms: 0,
+                ..Config::default()
+            }
+            .resolve(),
+            Err(ConfigError::InvalidBashTimeout)
         ));
     }
 

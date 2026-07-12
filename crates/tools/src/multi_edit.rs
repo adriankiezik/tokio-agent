@@ -108,10 +108,7 @@ mod tests {
         tokio::fs::write(root.join("file.txt"), "alpha beta")
             .await
             .unwrap();
-        let ctx = ToolCtx {
-            cwd: root.clone(),
-            cancel: CancellationToken::new(),
-        };
+        let ctx = ToolCtx::new(root.clone(), CancellationToken::new());
         let result = MultiEdit
             .run(
                 json!({

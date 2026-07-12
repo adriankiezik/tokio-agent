@@ -116,10 +116,7 @@ mod tests {
         tokio::fs::write(root.join("empty.txt"), "\n")
             .await
             .unwrap();
-        let ctx = ToolCtx {
-            cwd: root.clone(),
-            cancel: CancellationToken::new(),
-        };
+        let ctx = ToolCtx::new(root.clone(), CancellationToken::new());
 
         let result = Read.run(json!({"path": "empty.txt"}), &ctx).await;
 

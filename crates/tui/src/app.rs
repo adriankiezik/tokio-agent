@@ -183,8 +183,8 @@ fn run_extension_operation(operation: ExtensionOperation) -> io::Result<()> {
         ExtensionOperation::Install { id, registry } => {
             command.args(["install", &id, "--registry", &registry, "--approve"]);
         }
-        ExtensionOperation::SetEnabled { id, enabled } => {
-            command.args([if enabled { "enable" } else { "disable" }, &id, "--project"]);
+        ExtensionOperation::Uninstall { id } => {
+            command.args(["remove", &id]);
         }
     }
     let status = command
@@ -379,10 +379,12 @@ impl App {
                 }
                 Ok(Err(error)) => {
                     self.extension_operation = None;
+                    self.projection.extension_operation_failed();
                     tracing::warn!(%error, "extension operation failed");
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.extension_operation = None;
+                    self.projection.extension_operation_failed();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -428,7 +430,13 @@ impl App {
             return;
         }
         self.selection = None;
-        match self.projection.on_key(key) {
+        let effect = self.projection.on_key(key);
+        if let Some(entry) = self.projection.take_history_entry_to_persist()
+            && let Err(error) = tokio_agent_config::store_recent_message(&entry)
+        {
+            tracing::warn!(%error, "failed to persist recent history entry");
+        }
+        match effect {
             FrontendEffect::None => {}
             FrontendEffect::Quit => self.quit = true,
             FrontendEffect::ConfigureProvider => {
@@ -440,6 +448,7 @@ impl App {
             }
             FrontendEffect::Extension(operation) => {
                 if self.extension_operation.is_none() {
+                    self.projection.begin_extension_operation(&operation);
                     let (send, receive) = std::sync::mpsc::channel();
                     std::thread::spawn(move || {
                         let _ = send.send(run_extension_operation(operation));
@@ -470,10 +479,8 @@ impl App {
                         }
                     }
                     UiCommand::SetReasoningEffort(None) => {}
-                    UiCommand::UserMessage(message)
-                    | UiCommand::AutomaticMessage { text: message, .. }
-                    | UiCommand::Steer(message) => {
-                        if let Err(error) = tokio_agent_config::store_recent_message(message) {
+                    UiCommand::AutomaticMessage { text, .. } => {
+                        if let Err(error) = tokio_agent_config::store_recent_message(text) {
                             tracing::warn!(%error, "failed to persist recent message");
                         }
                     }
@@ -556,10 +563,11 @@ impl App {
             working_area,
             _working_spacing,
             permissions_area,
+            command_feedback_area,
             picker_area,
+            extensions_area,
             provider_notice_area,
             provider_area,
-            command_feedback_area,
             interaction_area,
             _footer_spacing,
             footer_area,
@@ -570,10 +578,11 @@ impl App {
             Constraint::Length(self.projection.working_indicator_height()),
             Constraint::Length(self.projection.working_indicator_height()),
             Constraint::Length(self.projection.permissions_panel_height()),
+            Constraint::Length(self.projection.command_feedback_height()),
             Constraint::Length(self.projection.slash_picker_height()),
+            Constraint::Length(self.projection.extension_manager_height()),
             Constraint::Length(self.projection.provider_change_notice_height()),
             Constraint::Length(provider_height),
-            Constraint::Length(self.projection.command_feedback_height()),
             Constraint::Length(self.projection.composer_height(frame.area().width)),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -587,15 +596,15 @@ impl App {
             .render_working_indicator(frame, working_area);
         self.projection
             .render_permissions_panel(frame, permissions_area);
-        self.projection.render_slash_picker(frame, picker_area);
-        self.projection
-            .render_provider_change_notice(frame, provider_notice_area);
         self.projection
             .render_command_feedback(frame, command_feedback_area);
+        self.projection.render_slash_picker(frame, picker_area);
+        self.projection
+            .render_extension_manager(frame, extensions_area);
+        self.projection
+            .render_provider_change_notice(frame, provider_notice_area);
         self.projection.render_interaction(frame, interaction_area);
         self.projection.render_footer(frame, footer_area);
-        self.projection
-            .render_extension_manager(frame, frame.area());
         self.selection_area = frame.area();
         self.visible_text = snapshot_and_highlight(frame, self.selection_area, self.selection);
         provider_area

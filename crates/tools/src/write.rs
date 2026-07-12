@@ -76,10 +76,7 @@ mod tests {
     #[tokio::test]
     async fn creates_parent_directories_and_writes_contents() {
         let root = temp_dir("write");
-        let ctx = ToolCtx {
-            cwd: root.clone(),
-            cancel: CancellationToken::new(),
-        };
+        let ctx = ToolCtx::new(root.clone(), CancellationToken::new());
         let result = Write
             .run(json!({"path": "nested/file.txt", "content": "hello"}), &ctx)
             .await;

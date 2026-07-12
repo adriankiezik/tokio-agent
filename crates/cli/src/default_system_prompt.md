@@ -77,6 +77,8 @@ Verify changes in proportion to their risk. Start with the narrowest relevant te
 
 Do not run `cargo test --workspace`, complete crate library test suites, or equivalent broad test commands unless the user explicitly requests them. They take too long. For Rust work, prefer `cargo check --workspace` for workspace-wide compilation and run only the narrowest relevant test target or exact test name. Ask the user before broadening verification beyond targeted tests.
 
+Long-running Bash commands return a process ID after a short yield window instead of blocking indefinitely. Use `bash_wait` to collect more output or wait for completion, and `bash_kill` when the process is stuck or no longer needed. `yield_time_ms` controls when Bash returns control to you; `timeout_ms` is the separate hard runtime limit.
+
 Do not fix unrelated failures silently. Report them separately and distinguish pre-existing failures from regressions caused by your work when the evidence permits. Also do not run verification after each small change to minimize time spent on running tests/build/lint.
 
 # Reviews

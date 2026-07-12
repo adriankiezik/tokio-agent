@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -50,9 +51,40 @@ impl ToolResult {
     }
 }
 
+pub type ToolProgress = Arc<dyn Fn(String) + Send + Sync>;
+
 pub struct ToolCtx {
     pub cwd: PathBuf,
     pub cancel: CancellationToken,
+    progress: Option<ToolProgress>,
+}
+
+impl ToolCtx {
+    #[must_use]
+    pub fn new(cwd: PathBuf, cancel: CancellationToken) -> Self {
+        Self {
+            cwd,
+            cancel,
+            progress: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_progress(mut self, progress: ToolProgress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    pub fn report_progress(&self, text: impl Into<String>) {
+        if let Some(progress) = &self.progress {
+            progress(text.into());
+        }
+    }
+
+    #[must_use]
+    pub fn progress_callback(&self) -> Option<ToolProgress> {
+        self.progress.clone()
+    }
 }
 
 pub trait Tool: Send + Sync {

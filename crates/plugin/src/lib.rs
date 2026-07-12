@@ -22,10 +22,7 @@ pub use commands::{
     builtin_command_catalog,
 };
 pub use companion::{CompanionError, CompanionManager, locate_companion};
-pub use config::{
-    CapabilityGrant, ConfigError, Enablement, ExtensionConfig, ExtensionScope, RegistryReference,
-    ResolvedEnablement,
-};
+pub use config::{CapabilityGrant, ConfigError, ExtensionConfig, RegistryReference};
 pub use lockfile::{ExtensionLock, LockError, LockedExtension, LockedSource};
 pub use manifest::{
     Capabilities, CommandContribution, ExtensionManifest, ManifestError, RuntimeContribution,

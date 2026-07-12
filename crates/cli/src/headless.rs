@@ -58,6 +58,10 @@ impl Printer {
                     println!("\x1b[36m● {name}\x1b[0m — {summary}");
                 }
             }
+            AgentEvent::ToolOutputDelta { text, .. } => {
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
             AgentEvent::ToolFinished { name, result, .. } => {
                 let ToolOutput::Text(text) = &result.output;
                 if name == "web_search" {

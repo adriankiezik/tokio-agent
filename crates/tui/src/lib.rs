@@ -1,4 +1,5 @@
 mod app;
+mod input;
 mod markdown;
 mod projection;
 mod provider_setup;

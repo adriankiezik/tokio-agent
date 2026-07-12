@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use tokio_agent_config::{AuthKind, Config, ConfigError, ProviderKind};
 
+use crate::input::is_cancel_key;
 use crate::theme;
 
 type DrawBackground<'a> = &'a mut dyn FnMut(&mut Frame, u16) -> Rect;
@@ -49,6 +50,25 @@ const OPTIONS: [ProviderOption; 4] = [
         default_model: "deepseek-v4-flash",
     },
 ];
+
+fn provider_menu_name(option: ProviderOption) -> &'static str {
+    option
+        .name
+        .strip_suffix(" API key")
+        .or_else(|| option.name.strip_suffix(" subscription"))
+        .unwrap_or(option.name)
+}
+
+fn provider_status_column_width() -> usize {
+    const MINIMUM_LABEL_WIDTH: usize = "Subscriptions".len();
+    OPTIONS
+        .iter()
+        .map(|option| provider_menu_name(*option).len())
+        .max()
+        .unwrap_or_default()
+        .max(MINIMUM_LABEL_WIDTH)
+        + 3
+}
 
 fn settings_for_provider(
     option: ProviderOption,
@@ -192,12 +212,19 @@ impl Setup {
             if event_key.kind != KeyEventKind::Press {
                 continue;
             }
+            if is_cancel_key(&event_key) {
+                if matches!(self.screen, Screen::Providers) {
+                    return Ok(false);
+                }
+                if matches!(self.screen, Screen::ApiKey { .. }) {
+                    self.screen = Screen::Providers;
+                    self.message = None;
+                    continue;
+                }
+                return Ok(true);
+            }
             match &mut self.screen {
                 Screen::Providers => match event_key.code {
-                    KeyCode::Esc => return Ok(false),
-                    KeyCode::Char('c') if event_key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(false);
-                    }
                     KeyCode::Up => self.selected = self.selected.saturating_sub(1),
                     KeyCode::Down => self.selected = (self.selected + 1).min(OPTIONS.len() - 1),
                     KeyCode::Enter => {
@@ -273,10 +300,6 @@ impl Setup {
                 },
                 Screen::ApiKey { option, key } => {
                     match key_event(event_key.code, event_key.modifiers) {
-                        KeyInput::Cancel => {
-                            self.screen = Screen::Providers;
-                            self.message = None;
-                        }
                         KeyInput::Backspace => {
                             key.pop();
                         }
@@ -304,13 +327,11 @@ impl Setup {
                         _ => {}
                     }
                 }
-                Screen::Success { .. } => match event_key.code {
-                    KeyCode::Enter | KeyCode::Esc => return Ok(true),
-                    KeyCode::Char('c') if event_key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Screen::Success { .. } => {
+                    if event_key.code == KeyCode::Enter {
                         return Ok(true);
                     }
-                    _ => {}
-                },
+                }
             }
         }
     }
@@ -380,6 +401,7 @@ impl Setup {
     }
 
     fn render_providers(&self, frame: &mut Frame, area: Rect) {
+        let status_column_width = provider_status_column_width();
         let mut lines = vec![Line::styled("Subscriptions", theme::bold())];
         for (index, option) in OPTIONS.iter().enumerate() {
             if index == 1 {
@@ -402,7 +424,10 @@ impl Setup {
             };
             lines.push(Line::from(vec![
                 Span::styled(marker, theme::running()),
-                Span::styled(format!("{:<25}", option.name), style),
+                Span::styled(
+                    format!("{:<status_column_width$}", provider_menu_name(*option)),
+                    style,
+                ),
                 Span::styled(status, style),
             ]));
         }
@@ -451,7 +476,6 @@ impl Setup {
 }
 
 enum KeyInput {
-    Cancel,
     Backspace,
     Character(char),
     Submit,
@@ -460,7 +484,6 @@ enum KeyInput {
 
 fn key_event(code: KeyCode, modifiers: KeyModifiers) -> KeyInput {
     match code {
-        KeyCode::Esc => KeyInput::Cancel,
         KeyCode::Backspace => KeyInput::Backspace,
         KeyCode::Enter => KeyInput::Submit,
         KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
@@ -482,6 +505,15 @@ fn inset(area: Rect, horizontal: u16, vertical: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_menu_does_not_repeat_api_key_label() {
+        assert_eq!(provider_menu_name(OPTIONS[0]), "ChatGPT");
+        assert_eq!(provider_menu_name(OPTIONS[1]), "OpenAI");
+        assert_eq!(provider_menu_name(OPTIONS[2]), "Anthropic");
+        assert_eq!(provider_menu_name(OPTIONS[3]), "DeepSeek");
+        assert_eq!(provider_status_column_width(), "Subscriptions".len() + 3);
+    }
 
     #[test]
     fn same_provider_retains_model_and_effort() {

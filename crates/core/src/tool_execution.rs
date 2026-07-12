@@ -168,12 +168,18 @@ impl ToolCallExecutor {
                     let name = call.name.clone();
                     let cwd = self.cwd.clone();
                     let tool_cancel = cancel.clone();
+                    let progress_events = events.clone();
+                    let progress_id = id.clone();
                     running.push(
                         async move {
-                            let ctx = ToolCtx {
-                                cwd,
-                                cancel: tool_cancel.clone(),
-                            };
+                            let progress: crate::tool::ToolProgress = Arc::new(move |text| {
+                                let _ = progress_events.send(AgentEvent::ToolOutputDelta {
+                                    id: progress_id.clone(),
+                                    text,
+                                });
+                            });
+                            let ctx = ToolCtx::new(cwd, tool_cancel.clone())
+                                .with_progress(progress);
                             let result = tokio::select! {
                                 result = tool.run(args, &ctx) => result,
                                 () = tool_cancel.cancelled() => ToolResult::error("cancelled by user"),
@@ -265,6 +271,15 @@ impl ToolCallExecutor {
 }
 
 fn tool_call_summary(name: &str, raw_args: &str) -> String {
+    if matches!(name, "bash_wait" | "bash_kill") {
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(raw_args) else {
+            return name.to_owned();
+        };
+        return args
+            .get("process_id")
+            .and_then(serde_json::Value::as_u64)
+            .map_or_else(|| name.to_owned(), |id| format!("process {id}"));
+    }
     let argument = match name {
         "bash" => "command",
         "read" | "write" | "edit" | "multi_edit" => "path",

@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 use tokio_agent_extension_api::{
-    ExtensionAction, ExtensionId, SessionEvent, StatusSegment, StatusSide, StatusTone,
+    ExtensionAction, ExtensionId, NoticeLevel, SessionEvent, StatusSegment, StatusSide, StatusTone,
     ToolDescriptor, ToolId,
 };
 
@@ -125,7 +125,8 @@ fn tool() -> ToolDescriptor {
 fn deactivate(text: &str) -> Vec<ExtensionAction> {
     vec![
         ExtensionAction::UnregisterTool(ToolId::new("tokio.goal:update_goal")),
-        ExtensionAction::SetStatusSegment(status(text)),
+        ExtensionAction::ClearStatusSegment("goal".into()),
+        ExtensionAction::ShowNotice { level: NoticeLevel::Info, text: text.into() },
         ExtensionAction::PersistSessionState(Vec::new()),
         ExtensionAction::ReleaseAutonomy,
     ]

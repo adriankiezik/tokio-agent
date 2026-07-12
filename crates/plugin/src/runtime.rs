@@ -401,7 +401,8 @@ impl SessionSupervisor {
             (ExtensionAction::ShowNotice { level, text }, ActionOutcome::Notice) => {
                 Ok(SupervisorEffect::Notice { level, text })
             }
-            (ExtensionAction::SetStatusSegment(_), ActionOutcome::StatusUpdated(_)) => {
+            (ExtensionAction::SetStatusSegment(_), ActionOutcome::StatusUpdated(_))
+            | (ExtensionAction::ClearStatusSegment(_), ActionOutcome::StatusCleared(_)) => {
                 Ok(SupervisorEffect::Status(self.state.status_segments()))
             }
             (ExtensionAction::RegisterTool(tool), ActionOutcome::ToolRegistered) => {

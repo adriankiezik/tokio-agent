@@ -1,7 +1,7 @@
 manifest_version = 1
 id = "tokio.goal"
 name = "Goal"
-version = "1.0.0"
+version = "1.0.1"
 description = "Continue working until an objective is verified complete"
 license = "MIT"
 host_api = ">=1.0, <2.0"

@@ -28,6 +28,10 @@ pub enum AgentEvent {
         name: String,
         summary: String,
     },
+    ToolOutputDelta {
+        id: crate::message::ToolCallId,
+        text: String,
+    },
     ToolFinished {
         id: crate::message::ToolCallId,
         name: String,
@@ -58,6 +62,7 @@ pub enum UiCommand {
         id: CommandId,
         arguments: String,
     },
+    CommandHandled(Option<String>),
     Clear,
     SetPermissionMode(Mode),
     SetModel(String),
@@ -368,6 +373,7 @@ impl<P: Provider> Agent<P> {
 
             let cancel = CancellationToken::new();
             let permissions = self.permissions.clone();
+            let command_router = self.command_router.clone();
             let mut steering = false;
             let mut shutting_down = false;
             let result = {
@@ -386,7 +392,44 @@ impl<P: Provider> Agent<P> {
                             }
                             Some(UiCommand::UserMessage(input)) => queued.push_back((input, false, None)),
                             Some(UiCommand::AutomaticMessage { source, text }) => queued.push_back((text, true, Some(source))),
-                            Some(UiCommand::InvokeCommand { .. }) => {},
+                            Some(UiCommand::InvokeCommand { id, arguments }) => {
+                                let Some(router) = command_router.as_ref() else {
+                                    let _ = events.send(AgentEvent::CommandHandled(Err(
+                                        "command routing is unavailable".to_owned(),
+                                    )));
+                                    continue;
+                                };
+                                match router(id, arguments) {
+                                    Ok(UiCommand::UserMessage(input)) => {
+                                        queued.push_back((input, false, None));
+                                    }
+                                    Ok(UiCommand::AutomaticMessage { source, text }) => {
+                                        queued.push_back((text, true, Some(source)));
+                                    }
+                                    Ok(UiCommand::Interrupt) => cancel.cancel(),
+                                    Ok(UiCommand::Approve { id, decision }) => {
+                                        permissions.resolve(id, decision);
+                                    }
+                                    Ok(UiCommand::CommandHandled(message)) => {
+                                        let _ = events.send(AgentEvent::CommandHandled(Ok(message)));
+                                    }
+                                    Ok(UiCommand::SetPermissionMode(mode)) => {
+                                        permissions.set_mode(mode);
+                                    }
+                                    Ok(UiCommand::InvokeCommand { .. })
+                                    | Ok(UiCommand::SetModel(_))
+                                    | Ok(UiCommand::SetReasoningEffort(_))
+                                    | Ok(UiCommand::Clear)
+                                    | Ok(UiCommand::Shutdown)
+                                    | Ok(UiCommand::Steer(_)) => {}
+                                    Err(error) => {
+                                        let _ = events.send(AgentEvent::CommandHandled(Err(error)));
+                                    }
+                                }
+                            },
+                            Some(UiCommand::CommandHandled(message)) => {
+                                let _ = events.send(AgentEvent::CommandHandled(Ok(message)));
+                            }
                             Some(UiCommand::SetPermissionMode(mode)) => permissions.set_mode(mode),
                             Some(UiCommand::SetModel(_))
                             | Some(UiCommand::SetReasoningEffort(_))
@@ -493,6 +536,9 @@ impl<P: Provider> Agent<P> {
                         }
                     }
                     Some(UiCommand::Interrupt) => {}
+                    Some(UiCommand::CommandHandled(message)) => {
+                        let _ = events.send(AgentEvent::CommandHandled(Ok(message)));
+                    }
                     Some(UiCommand::Clear) => {
                         self.context.clear();
                         let _ = events.send(AgentEvent::CommandHandled(Ok(None)));

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -12,7 +13,7 @@ use tokio_agent_extension_api::{
     HostResponse, RuntimeLimits, Sequenced,
 };
 use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Cache, CacheConfig, Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -49,12 +50,17 @@ struct Host {
 }
 
 impl Host {
-    fn new() -> anyhow::Result<Self> {
+    fn new(cache_directory: Option<&Path>) -> anyhow::Result<Self> {
         let mut config = Config::new();
         config
             .wasm_component_model(true)
             .consume_fuel(true)
             .epoch_interruption(true);
+        if let Some(cache_directory) = cache_directory {
+            let mut cache_config = CacheConfig::new();
+            cache_config.with_directory(cache_directory);
+            config.cache(Some(Cache::new(cache_config)?));
+        }
         let engine = Engine::new(&config)?;
         Ok(Self {
             engine,
@@ -495,9 +501,25 @@ fn deadline_guard(engine: Engine, deadline: Duration) -> Arc<AtomicBool> {
     running
 }
 
+fn cache_directory_from_args() -> anyhow::Result<Option<PathBuf>> {
+    let mut args = std::env::args_os().skip(1);
+    let Some(flag) = args.next() else {
+        return Ok(None);
+    };
+    if flag != "--cache-dir" {
+        anyhow::bail!("unknown argument `{}`", flag.to_string_lossy());
+    }
+    let directory = args.next().context("--cache-dir requires a path")?;
+    if let Some(extra) = args.next() {
+        anyhow::bail!("unexpected argument `{}`", extra.to_string_lossy());
+    }
+    Ok(Some(PathBuf::from(directory)))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut host = Host::new()?;
+    let cache_directory = cache_directory_from_args()?;
+    let mut host = Host::new(cache_directory.as_deref())?;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     while let Some(line) = lines.next_line().await? {

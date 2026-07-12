@@ -292,8 +292,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-agent-official-loop"
-version = "1.0.0"
+name = "tokio-loop"
+version = "1.0.2"
 dependencies = [
  "serde_json",
  "tokio-agent-extension-api",

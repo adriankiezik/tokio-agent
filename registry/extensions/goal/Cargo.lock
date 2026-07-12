@@ -292,8 +292,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-agent-official-goal"
-version = "1.0.0"
+name = "tokio-goal"
+version = "1.0.1"
 dependencies = [
  "serde_json",
  "tokio-agent-extension-api",

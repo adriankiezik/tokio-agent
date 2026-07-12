@@ -49,6 +49,8 @@ impl<'a> SessionBuilder<'a> {
             reasoning_effort,
             permission_mode,
             system_prompt,
+            bash_yield_time_ms,
+            bash_timeout_ms,
         } = self.config;
         let supports_reasoning_effort = matches!(
             provider_kind,
@@ -60,7 +62,7 @@ impl<'a> SessionBuilder<'a> {
             PermissionMode::FullAuto => Mode::FullAuto,
         };
 
-        let tools = tools_for_provider(provider_kind);
+        let tools = tools_for_provider(provider_kind, bash_yield_time_ms, bash_timeout_ms);
 
         let provider = match provider_kind {
             ProviderKind::Anthropic => {
@@ -102,17 +104,16 @@ impl<'a> SessionBuilder<'a> {
                 let router = route_router
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                route_command(&router, &command_cwd, route_runtime.as_ref(), id, arguments)
+                route_command(&router, &command_cwd, &route_runtime, id, arguments)
             })
             .with_extension_catalog(extension_catalog.clone())
             .with_reasoning_effort_support(supports_reasoning_effort)
             .with_provider_name(provider_kind.as_str())
             .with_context_window(context_window_tokens);
-        if let Some(runtime) = &extension_runtime {
-            let hook = runtime.clone();
-            agent = agent.with_session_hook(move |event| hook.event(event));
-        }
+        let hook = extension_runtime.clone();
+        agent = agent.with_session_hook(move |event| hook.event(event));
         let watcher_router = Arc::clone(&command_router);
+        let watcher_runtime = extension_runtime.clone();
         let watcher_cwd = self.cwd.to_path_buf();
         let watcher_state = Arc::new(std::sync::Mutex::new((
             std::time::Instant::now(),
@@ -121,15 +122,16 @@ impl<'a> SessionBuilder<'a> {
             extension_catalog,
         )));
         agent = agent.with_session_poll(move || {
-            let mut effects = extension_runtime
-                .as_ref()
-                .map_or_else(Vec::new, |runtime| runtime.poll());
+            let mut effects = extension_runtime.poll();
             let mut state = watcher_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.0.elapsed() >= std::time::Duration::from_millis(500) {
                 state.0 = std::time::Instant::now();
-                if let Ok(router) = build_command_router(&watcher_cwd) {
+                if let Ok(router) = build_command_router(&watcher_cwd)
+                    && let Ok(packages) = load_programmable_packages(&watcher_cwd)
+                    && watcher_runtime.load(packages).is_ok()
+                {
                     let catalog = router.catalog();
                     *watcher_router
                         .write()
@@ -226,7 +228,7 @@ fn load_prompt_commands(
     Vec<tokio_agent_plugin::PromptCommand>,
     Vec<tokio_agent_extension_api::CommandDescriptor>,
 )> {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use tokio_agent_plugin::ExtensionConfig;
 
     let mut commands =
@@ -238,26 +240,11 @@ fn load_prompt_commands(
         None => ExtensionConfig::default(),
     };
     let project = ExtensionConfig::load(&cwd.join(".tokio-agent/extensions.toml"))?;
-    let ids: BTreeSet<_> = user
-        .linked
-        .keys()
-        .chain(project.linked.keys())
-        .chain(user.extensions.keys())
-        .chain(project.extensions.keys())
-        .cloned()
-        .collect();
+    let ids = installed_extension_ids(&user, &project)?;
     for id in ids {
-        if !ExtensionConfig::resolve(&id, &user, &project).enabled {
-            continue;
-        }
         let root = resolve_extension_root(cwd, &id, &user, &project)?
-            .with_context(|| format!("enabled extension `{id}` is not installed or linked"))?;
+            .with_context(|| format!("extension `{id}` is not installed or linked"))?;
         let manifest = tokio_agent_plugin::validate_package(&root, &semver::Version::new(1, 0, 0))?;
-        if manifest.id.starts_with("tokio.")
-            && (project.linked.contains_key(&id) || user.linked.contains_key(&id))
-        {
-            anyhow::bail!("the `tokio.*` namespace is reserved for the built-in official registry");
-        }
         if manifest.id != id {
             anyhow::bail!(
                 "linked extension ID `{id}` does not match manifest ID `{}`",
@@ -352,7 +339,6 @@ fn load_prompt_commands(
 fn load_programmable_packages(
     cwd: &Path,
 ) -> anyhow::Result<Vec<crate::extension_runtime::ProgrammablePackage>> {
-    use std::collections::BTreeSet;
     use tokio_agent_plugin::{CapabilityGrant, ExtensionConfig, LockedSource};
     let user_path = dirs::config_dir().map(|path| path.join("tokio-agent/extensions.toml"));
     let user = match user_path {
@@ -360,22 +346,12 @@ fn load_programmable_packages(
         None => ExtensionConfig::default(),
     };
     let project = ExtensionConfig::load(&cwd.join(".tokio-agent/extensions.toml"))?;
-    let ids: BTreeSet<_> = user
-        .extensions
-        .keys()
-        .chain(project.extensions.keys())
-        .chain(user.linked.keys())
-        .chain(project.linked.keys())
-        .cloned()
-        .collect();
+    let ids = installed_extension_ids(&user, &project)?;
     let store = tokio_agent_plugin::PackageStore::user_default(semver::Version::new(1, 0, 0))?;
     let records =
         tokio_agent_plugin::ExtensionLock::load(&store.root().join("installations.lock"))?;
     let mut packages = Vec::new();
     for id in ids {
-        if !ExtensionConfig::resolve(&id, &user, &project).enabled {
-            continue;
-        }
         let Some(root) = resolve_extension_root(cwd, &id, &user, &project)? else {
             continue;
         };
@@ -417,6 +393,21 @@ fn load_programmable_packages(
     Ok(packages)
 }
 
+fn installed_extension_ids(
+    user: &tokio_agent_plugin::ExtensionConfig,
+    project: &tokio_agent_plugin::ExtensionConfig,
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let mut ids: std::collections::BTreeSet<String> = user
+        .linked
+        .keys()
+        .chain(project.linked.keys())
+        .cloned()
+        .collect();
+    let store = tokio_agent_plugin::PackageStore::user_default(semver::Version::new(1, 0, 0))?;
+    ids.extend(store.list()?.into_iter().map(|package| package.manifest.id));
+    Ok(ids)
+}
+
 fn resolve_extension_root(
     cwd: &Path,
     id: &str,
@@ -447,7 +438,7 @@ fn resolve_extension_root(
 fn load_extension_summaries(
     cwd: &Path,
 ) -> anyhow::Result<Vec<tokio_agent_extension_api::ExtensionSummary>> {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use tokio_agent_extension_api::{ExtensionId, ExtensionOrigin, ExtensionSummary};
     use tokio_agent_plugin::ExtensionConfig;
 
@@ -458,23 +449,28 @@ fn load_extension_summaries(
     };
     let project = ExtensionConfig::load(&cwd.join(".tokio-agent/extensions.toml"))?;
     let mut summaries = BTreeMap::new();
-    let ids: BTreeSet<_> = user
+    let registry_installed_ids: std::collections::BTreeSet<_> =
+        tokio_agent_plugin::PackageStore::user_default(semver::Version::new(1, 0, 0))
+            .ok()
+            .and_then(|store| store.list().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|package| package.manifest.id)
+            .collect();
+    let ids: std::collections::BTreeSet<_> = user
         .linked
         .keys()
         .chain(project.linked.keys())
-        .chain(user.extensions.keys())
-        .chain(project.extensions.keys())
         .cloned()
         .collect();
     for id in ids {
         let root = project.linked.get(&id).or_else(|| user.linked.get(&id));
         let Some(root) = root else { continue };
         let manifest = tokio_agent_plugin::validate_package(root, &semver::Version::new(1, 0, 0))?;
-        let enabled = ExtensionConfig::resolve(&id, &user, &project).enabled;
         summaries.insert(
             id.clone(),
             ExtensionSummary {
-                id: ExtensionId::new(id),
+                id: ExtensionId::new(id.clone()),
                 name: manifest.name,
                 version: manifest.version,
                 description: manifest.description,
@@ -482,7 +478,7 @@ fn load_extension_summaries(
                     path: root.to_string_lossy().into_owned(),
                 },
                 installed: true,
-                enabled,
+                local_override: registry_installed_ids.contains(&id),
                 capabilities: manifest.capabilities.as_set().into_iter().collect(),
                 commands: manifest
                     .commands
@@ -560,7 +556,7 @@ fn load_extension_summaries(
                     description: manifest.description,
                     origin,
                     installed: true,
-                    enabled: ExtensionConfig::resolve(&id, &user, &project).enabled,
+                    local_override: false,
                     capabilities: manifest.capabilities.as_set().into_iter().collect(),
                     commands: manifest
                         .commands
@@ -600,7 +596,7 @@ fn load_extension_summaries(
                 description: result.package.description,
                 origin,
                 installed: false,
-                enabled: false,
+                local_override: false,
                 capabilities: result.package.capabilities.into_iter().collect(),
                 commands: result
                     .package
@@ -620,7 +616,7 @@ fn load_extension_summaries(
 fn route_command(
     router: &tokio_agent_plugin::CommandRouter,
     cwd: &Path,
-    extension_runtime: Option<&crate::extension_runtime::ExtensionRuntime>,
+    extension_runtime: &crate::extension_runtime::ExtensionRuntime,
     id: tokio_agent_extension_api::CommandId,
     arguments: String,
 ) -> Result<tokio_agent_core::agent::UiCommand, String> {
@@ -649,25 +645,10 @@ fn route_command(
             return Err("the extension manager is not available in headless mode".to_owned());
         }
         RoutedCommand::Extension { id, arguments } => {
-            let runtime = extension_runtime
-                .ok_or_else(|| "programmable command runtime is unavailable".to_owned())?;
-            let (prompt, automatic) = runtime
+            let prompt = extension_runtime
                 .route(&id, arguments)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("unknown programmable command `{id}`"))?;
-            if automatic {
-                let source = tokio_agent_extension_api::ExtensionId::new(
-                    id.as_str()
-                        .split_once(':')
-                        .map_or(id.as_str(), |(owner, _)| owner),
-                );
-                UiCommand::AutomaticMessage {
-                    source,
-                    text: prompt,
-                }
-            } else {
-                UiCommand::UserMessage(prompt)
-            }
+                .map_err(|error| error.to_string())?;
+            extension_command_result(&id, prompt)
         }
         RoutedCommand::Interrupt | RoutedCommand::Approve { .. } | RoutedCommand::Shutdown => {
             return Err("invalid routed command".to_owned());
@@ -675,8 +656,38 @@ fn route_command(
     })
 }
 
-fn tools_for_provider(provider: ProviderKind) -> Vec<Arc<dyn tokio_agent_core::Tool>> {
-    let mut tools = tokio_agent_tools::builtins();
+fn extension_command_result(
+    id: &tokio_agent_extension_api::CommandId,
+    prompt: Option<(String, bool)>,
+) -> tokio_agent_core::agent::UiCommand {
+    use tokio_agent_core::agent::UiCommand;
+
+    match prompt {
+        Some((prompt, true)) => {
+            let source = tokio_agent_extension_api::ExtensionId::new(
+                id.as_str()
+                    .split_once(':')
+                    .map_or(id.as_str(), |(owner, _)| owner),
+            );
+            UiCommand::AutomaticMessage {
+                source,
+                text: prompt,
+            }
+        }
+        Some((prompt, false)) => UiCommand::UserMessage(prompt),
+        None => UiCommand::CommandHandled(None),
+    }
+}
+
+fn tools_for_provider(
+    provider: ProviderKind,
+    bash_yield_time_ms: u64,
+    bash_timeout_ms: u64,
+) -> Vec<Arc<dyn tokio_agent_core::Tool>> {
+    let mut tools = tokio_agent_tools::builtins_with_bash_config(tokio_agent_tools::BashConfig {
+        yield_time_ms: bash_yield_time_ms,
+        timeout_ms: bash_timeout_ms,
+    });
     if !matches!(provider, ProviderKind::OpenAi) {
         tools.push(Arc::new(tokio_agent_tools::WebSearch::new()));
     }
@@ -698,6 +709,8 @@ mod tests {
             reasoning_effort: None,
             permission_mode: permission_mode.into(),
             system_prompt: None,
+            bash_yield_time_ms: 10_000,
+            bash_timeout_ms: 600_000,
         }
     }
 
@@ -722,12 +735,25 @@ mod tests {
     }
 
     #[test]
+    fn programmable_command_without_a_prompt_is_still_handled() {
+        let command = extension_command_result(
+            &tokio_agent_extension_api::CommandId::new("tokio.loop:loop"),
+            None,
+        );
+
+        assert!(matches!(
+            command,
+            tokio_agent_core::agent::UiCommand::CommandHandled(None)
+        ));
+    }
+
+    #[test]
     fn search_tool_is_selected_automatically_by_provider() {
-        let anthropic_names: Vec<_> = tools_for_provider(ProviderKind::Anthropic)
+        let anthropic_names: Vec<_> = tools_for_provider(ProviderKind::Anthropic, 10_000, 600_000)
             .into_iter()
             .map(|tool| tool.schema().name)
             .collect();
-        let openai_names: Vec<_> = tools_for_provider(ProviderKind::OpenAi)
+        let openai_names: Vec<_> = tools_for_provider(ProviderKind::OpenAi, 10_000, 600_000)
             .into_iter()
             .map(|tool| tool.schema().name)
             .collect();

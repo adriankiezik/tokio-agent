@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use tokio_agent_core::agent::{AgentEvent, UiCommand};
 use tokio_agent_core::message::{ToolOutput, Usage};
 use tokio_agent_core::permission::{Decision, Mode, PermissionId};
@@ -16,6 +16,7 @@ use tokio_agent_extension_api::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::input::is_cancel_key;
 use crate::theme;
 
 #[path = "composer.rs"]
@@ -29,7 +30,7 @@ use transcript::Transcript;
 #[derive(Debug)]
 pub(crate) enum ExtensionOperation {
     Install { id: String, registry: String },
-    SetEnabled { id: String, enabled: bool },
+    Uninstall { id: String },
 }
 
 pub(crate) enum FrontendEffect {
@@ -45,8 +46,10 @@ pub(crate) enum FrontendEffect {
 struct SlashCommand {
     name: Cow<'static, str>,
     description: Cow<'static, str>,
+    source: Cow<'static, str>,
     usage: Option<Cow<'static, str>>,
     action: SlashAction,
+    available_while_running: bool,
 }
 
 #[derive(Clone)]
@@ -85,18 +88,36 @@ const PERMISSION_MODES: [PermissionModeOption; 3] = [
 ];
 
 const QUIT_CONFIRMATION: Duration = Duration::from_secs(3);
-const COMMAND_NOTICE_DURATION: Duration = Duration::from_secs(3);
+const NOTIFICATION_DURATION: Duration = Duration::from_secs(3);
 
 struct Pending {
     id: PermissionId,
     request: PermissionRequest,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct Notification {
+    message: String,
+    expires_at: Instant,
+}
+
+impl Notification {
+    fn new(message: String) -> Self {
+        Self {
+            message,
+            expires_at: Instant::now() + NOTIFICATION_DURATION,
+        }
+    }
+
+    fn active_message(&self) -> Option<&str> {
+        (self.expires_at > Instant::now()).then_some(self.message.as_str())
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExtensionTab {
     Discover,
     Installed,
-    Updates,
 }
 
 #[derive(Clone, Copy)]
@@ -125,6 +146,7 @@ pub(crate) struct FrontendProjection {
     history: Vec<String>,
     history_cursor: Option<usize>,
     history_draft: String,
+    history_entry_to_persist: Option<String>,
     permission_mode: Mode,
     permissions_selected: Option<usize>,
     setting_picker: Option<SettingPicker>,
@@ -133,15 +155,15 @@ pub(crate) struct FrontendProjection {
     context_usage_known: bool,
     quit_armed_until: Option<Instant>,
     scroll_button_area: Option<Rect>,
-    command_error: Option<String>,
-    command_notice: Option<(String, Instant)>,
+    command_error: Option<Notification>,
+    command_notice: Option<Notification>,
     extension_commands: Vec<SlashCommand>,
     status_segments: Vec<StatusSegment>,
     extensions: Vec<ExtensionSummary>,
     extension_manager: Option<usize>,
     extension_tab: ExtensionTab,
-    extension_search: String,
-    extension_disable_confirmation: Option<String>,
+    extension_details_visible: bool,
+    installing_extension: Option<(String, String)>,
 }
 
 impl FrontendProjection {
@@ -178,6 +200,7 @@ impl FrontendProjection {
             history,
             history_cursor: None,
             history_draft: String::new(),
+            history_entry_to_persist: None,
             permission_mode,
             permissions_selected: None,
             setting_picker: None,
@@ -196,8 +219,8 @@ impl FrontendProjection {
             extensions,
             extension_manager: None,
             extension_tab: ExtensionTab::Installed,
-            extension_search: String::new(),
-            extension_disable_confirmation: None,
+            extension_details_visible: false,
+            installing_extension: None,
         }
     }
 
@@ -223,7 +246,10 @@ impl FrontendProjection {
         self.permission_mode = permission_mode;
         self.extension_commands = commands.into_iter().map(extension_slash_command).collect();
         self.extensions = extensions;
-        self.extension_manager = None;
+        self.installing_extension = None;
+        self.extension_manager = self
+            .extension_manager
+            .map(|selected| selected.min(self.visible_extensions().len().saturating_sub(1)));
         self.pending = None;
         self.running = false;
         self.interrupting = false;
@@ -241,50 +267,43 @@ impl FrontendProjection {
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> FrontendEffect {
         self.command_error = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if let Some(id) = self.extension_disable_confirmation.clone() {
-            match key.code {
-                KeyCode::Esc => self.extension_disable_confirmation = None,
-                KeyCode::Enter | KeyCode::Char('e') => {
-                    self.extension_disable_confirmation = None;
-                    return FrontendEffect::Extension(ExtensionOperation::SetEnabled {
-                        id,
-                        enabled: false,
-                    });
-                }
-                _ => {}
-            }
-            return FrontendEffect::None;
+        if is_cancel_key(&key)
+            && let Some(effect) = self.dismiss_active_menu()
+        {
+            return effect;
         }
         if let Some(selected) = self.extension_manager {
             let selected_extension = self.visible_extensions().get(selected).copied().cloned();
             match key.code {
-                KeyCode::Esc => self.extension_manager = None,
-                KeyCode::Up => self.extension_manager = Some(selected.saturating_sub(1)),
+                KeyCode::Up => {
+                    self.extension_manager = Some(selected.saturating_sub(1));
+                    self.extension_details_visible = false;
+                }
                 KeyCode::Down => {
                     self.extension_manager =
                         Some((selected + 1).min(self.visible_extensions().len().saturating_sub(1)));
+                    self.extension_details_visible = false;
                 }
                 KeyCode::Left => {
                     self.extension_tab = match self.extension_tab {
-                        ExtensionTab::Discover => ExtensionTab::Updates,
+                        ExtensionTab::Discover => ExtensionTab::Installed,
                         ExtensionTab::Installed => ExtensionTab::Discover,
-                        ExtensionTab::Updates => ExtensionTab::Installed,
                     };
                     self.extension_manager = Some(0);
+                    self.extension_details_visible = false;
                 }
                 KeyCode::Right | KeyCode::Tab => {
                     self.extension_tab = match self.extension_tab {
                         ExtensionTab::Discover => ExtensionTab::Installed,
-                        ExtensionTab::Installed => ExtensionTab::Updates,
-                        ExtensionTab::Updates => ExtensionTab::Discover,
+                        ExtensionTab::Installed => ExtensionTab::Discover,
                     };
                     self.extension_manager = Some(0);
+                    self.extension_details_visible = false;
                 }
-                KeyCode::Backspace => {
-                    self.extension_search.pop();
-                    self.extension_manager = Some(0);
+                KeyCode::Char('D') => {
+                    self.extension_details_visible = !self.extension_details_visible;
                 }
-                KeyCode::Char('i')
+                KeyCode::Enter
                     if selected_extension
                         .as_ref()
                         .is_some_and(|extension| !extension.installed) =>
@@ -308,40 +327,23 @@ impl FrontendProjection {
                         });
                     }
                 }
-                KeyCode::Char('e')
+                KeyCode::Char('x')
                     if selected_extension
                         .as_ref()
                         .is_some_and(|extension| extension.installed) =>
                 {
                     if let Some(extension) = selected_extension {
-                        if extension.enabled
-                            && extension.capabilities.contains(
-                                &tokio_agent_extension_api::Capability::SessionSubmitAutomatic,
-                            )
-                        {
-                            self.extension_disable_confirmation = Some(extension.id.to_string());
-                            return FrontendEffect::None;
-                        }
-                        return FrontendEffect::Extension(ExtensionOperation::SetEnabled {
+                        return FrontendEffect::Extension(ExtensionOperation::Uninstall {
                             id: extension.id.to_string(),
-                            enabled: !extension.enabled,
                         });
                     }
-                }
-                KeyCode::Char(character)
-                    if !key.modifiers.intersects(
-                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                    ) =>
-                {
-                    self.extension_search.push(character);
-                    self.extension_manager = Some(0);
                 }
                 _ => {}
             }
             return FrontendEffect::None;
         }
         if self.provider_change_notice {
-            if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            if key.code == KeyCode::Enter {
                 self.provider_change_notice = false;
                 return FrontendEffect::ConfigureProvider;
             }
@@ -377,6 +379,29 @@ impl FrontendProjection {
         self.composer.insert_str(&normalized);
         self.leave_history();
         self.slash_selected = 0;
+    }
+
+    fn dismiss_active_menu(&mut self) -> Option<FrontendEffect> {
+        if self.extension_manager.take().is_some() {
+            self.extension_details_visible = false;
+            return Some(FrontendEffect::None);
+        }
+        if self.provider_change_notice {
+            self.provider_change_notice = false;
+            return Some(FrontendEffect::ConfigureProvider);
+        }
+        if self.permissions_selected.take().is_some() {
+            return Some(FrontendEffect::None);
+        }
+        if self.setting_picker.take().is_some() {
+            return Some(FrontendEffect::None);
+        }
+        if self.interrupting || self.pending.is_some() || !self.slash_picker_open() {
+            return None;
+        }
+        self.composer.clear();
+        self.slash_selected = 0;
+        Some(FrontendEffect::None)
     }
 
     fn handle_pending_key(&mut self, code: KeyCode, ctrl: bool) -> Option<FrontendEffect> {
@@ -416,10 +441,6 @@ impl FrontendProjection {
                 self.permission_mode = mode;
                 self.permissions_selected = None;
                 Some(FrontendEffect::Command(UiCommand::SetPermissionMode(mode)))
-            }
-            KeyCode::Esc => {
-                self.permissions_selected = None;
-                Some(FrontendEffect::None)
             }
             _ => Some(FrontendEffect::None),
         }
@@ -480,10 +501,6 @@ impl FrontendProjection {
                     }
                 }
             }
-            KeyCode::Esc => {
-                self.setting_picker = None;
-                Some(FrontendEffect::None)
-            }
             _ => Some(FrontendEffect::None),
         }
     }
@@ -500,20 +517,14 @@ impl FrontendProjection {
         if !self.slash_picker_open() {
             return None;
         }
+        let match_count = self.slash_matches().len();
         match key.code {
-            KeyCode::Up => {
-                let count = self.slash_matches().len();
-                self.slash_selected = self.slash_selected.saturating_sub(1);
-                if count > 0 {
-                    self.slash_selected = self.slash_selected.min(count - 1);
-                }
+            KeyCode::Up if match_count > 1 => {
+                self.slash_selected = self.slash_selected.saturating_sub(1).min(match_count - 1);
                 Some(FrontendEffect::None)
             }
-            KeyCode::Down => {
-                let count = self.slash_matches().len();
-                if count > 0 {
-                    self.slash_selected = (self.slash_selected + 1).min(count - 1);
-                }
+            KeyCode::Down if match_count > 1 => {
+                self.slash_selected = (self.slash_selected + 1).min(match_count - 1);
                 Some(FrontendEffect::None)
             }
             KeyCode::Tab => {
@@ -533,13 +544,9 @@ impl FrontendProjection {
                 Some(if allowed {
                     self.run_selected_slash_command()
                 } else {
+                    self.reject_running_slash_command();
                     FrontendEffect::None
                 })
-            }
-            KeyCode::Esc => {
-                self.composer.clear();
-                self.slash_selected = 0;
-                Some(FrontendEffect::None)
             }
             _ => None,
         }
@@ -649,6 +656,18 @@ impl FrontendProjection {
         }
     }
 
+    fn record_history(&mut self, entry: String) {
+        if self.history.last() != Some(&entry) {
+            self.history.push(entry.clone());
+            self.history_entry_to_persist = Some(entry);
+        }
+        self.leave_history();
+    }
+
+    pub(crate) fn take_history_entry_to_persist(&mut self) -> Option<String> {
+        self.history_entry_to_persist.take()
+    }
+
     fn history_previous(&mut self) {
         if self.history.is_empty() {
             return;
@@ -731,10 +750,24 @@ impl FrontendProjection {
             .cloned()
     }
 
+    fn reject_running_slash_command(&mut self) {
+        if let Some(command) = self.selected_slash_command() {
+            self.composer.clear();
+            self.slash_selected = 0;
+            self.command_error = Some(Notification::new(format!(
+                "{} is unavailable while a turn is running",
+                command.name
+            )));
+        }
+    }
+
     fn run_selected_slash_command(&mut self) -> FrontendEffect {
         let Some(command) = self.selected_slash_command() else {
             return self.submit();
         };
+        if !matches!(&command.action, SlashAction::Extension(_)) {
+            self.record_history(command.name.to_string());
+        }
         self.composer.clear();
         self.slash_selected = 0;
         match command.action {
@@ -770,6 +803,7 @@ impl FrontendProjection {
             SlashAction::Provider => FrontendEffect::ConfigureProvider,
             SlashAction::Extensions => {
                 self.extension_manager = Some(0);
+                self.extension_details_visible = false;
                 FrontendEffect::None
             }
             SlashAction::Extension(_) => {
@@ -798,41 +832,24 @@ impl FrontendProjection {
                 .cloned()
                 && let SlashAction::Extension(id) = command.action
             {
-                if self.running {
-                    self.command_error =
-                        Some(format!("{name} is unavailable while a turn is running"));
+                self.composer.clear();
+                self.record_history(message.clone());
+                if self.running && !command.available_while_running {
+                    self.command_error = Some(Notification::new(format!(
+                        "{name} is unavailable while a turn is running"
+                    )));
                     return FrontendEffect::None;
                 }
-                self.composer.clear();
-                if self.history.last() != Some(&message) {
-                    self.history.push(message.clone());
-                }
-                self.leave_history();
-                self.begin_turn(&message);
                 return FrontendEffect::Command(UiCommand::InvokeCommand {
                     id,
                     arguments: arguments.trim().to_owned(),
                 });
             }
-            if let Some(extension) = self.extensions.iter().find(|extension| {
-                extension.installed
-                    && !extension.enabled
-                    && extension.commands.iter().any(|command| command == name)
-            }) {
-                self.command_error = Some(format!(
-                    "{name} is provided by “{}”, which is installed but disabled · open /extensions to enable it",
-                    extension.name
-                ));
-            } else {
-                self.command_error = Some(format!("Unknown command: {name}"));
-            }
+            self.command_error = Some(Notification::new(format!("Unknown command: {name}")));
             return FrontendEffect::None;
         }
         self.composer.clear();
-        if self.history.last() != Some(&message) {
-            self.history.push(message.clone());
-        }
-        self.leave_history();
+        self.record_history(message.clone());
         if self.running {
             self.transcript.push_user(message.clone());
             self.scroll_up = 0;
@@ -853,14 +870,17 @@ impl FrontendProjection {
     fn active_command_notice(&self) -> Option<&str> {
         self.command_notice
             .as_ref()
-            .filter(|(_, expires_at)| *expires_at > Instant::now())
-            .map(|(message, _)| message.as_str())
+            .and_then(Notification::active_message)
+    }
+
+    fn active_command_error(&self) -> Option<&str> {
+        self.command_error
+            .as_ref()
+            .and_then(Notification::active_message)
     }
 
     pub(crate) fn command_feedback_height(&self) -> u16 {
-        if (self.command_error.is_some() || self.active_command_notice().is_some())
-            && self.pending.is_none()
-        {
+        if self.active_command_error().is_some() && self.pending.is_none() {
             2
         } else {
             0
@@ -868,17 +888,10 @@ impl FrontendProjection {
     }
 
     pub(crate) fn render_command_feedback(&self, frame: &mut Frame, area: Rect) {
-        let feedback = self
-            .command_error
-            .as_deref()
-            .map(|error| (error, theme::error()))
-            .or_else(|| {
-                self.active_command_notice()
-                    .map(|notice| (notice, theme::success()))
-            });
-        if let Some((message, style)) = feedback {
+        if let Some(message) = self.active_command_error() {
             frame.render_widget(
-                Paragraph::new(Line::from(vec![Span::raw("  "), Span::raw(message)])).style(style),
+                Paragraph::new(Line::from(vec![Span::raw("  "), Span::raw(message)]))
+                    .style(theme::error()),
                 area,
             );
         }
@@ -904,6 +917,8 @@ impl FrontendProjection {
         let matches = self.slash_display_matches();
         let name_width = slash_command_name_width(&matches);
         let query = self.composer.text();
+        let description_width = slash_command_description_width(&matches, query);
+        let has_multiple_matches = matches.len() > 1;
         let lines = matches
             .into_iter()
             .enumerate()
@@ -913,26 +928,32 @@ impl FrontendProjection {
                 } else {
                     "  "
                 };
-                let (marker_style, command_style) = if index == self.slash_selected {
-                    (theme::running(), theme::picker_selected())
-                } else {
-                    (theme::picker_muted(), theme::picker_muted())
-                };
-                Line::from(vec![
+                let (marker_style, command_style) =
+                    if has_multiple_matches && index == self.slash_selected {
+                        (
+                            theme::running().add_modifier(ratatui::style::Modifier::BOLD),
+                            theme::picker_selected(),
+                        )
+                    } else {
+                        (theme::picker_muted(), theme::picker_muted())
+                    };
+                let description = slash_command_description(
+                    &command,
+                    command_usage_visible(&command.name, query),
+                );
+                let mut spans = vec![
                     Span::styled(marker, marker_style),
                     Span::styled(
                         format!("{:<width$}", command.name, width = name_width),
                         command_style,
                     ),
                     Span::raw("  "),
-                    Span::styled(
-                        slash_command_description(
-                            &command,
-                            command_usage_visible(&command.name, query),
-                        ),
-                        theme::picker_muted(),
-                    ),
-                ])
+                    Span::styled(description.clone(), command_style),
+                ];
+                let padding = description_width.saturating_sub(description.width());
+                spans.push(Span::raw(format!("{:padding$}  ", "")));
+                spans.push(Span::styled(command.source, command_style));
+                Line::from(spans)
             })
             .collect::<Vec<_>>();
         let inner = Rect {
@@ -1111,6 +1132,9 @@ impl FrontendProjection {
             AgentEvent::ToolStarted { id, name, summary } => {
                 self.transcript.tool_start(id, name, summary);
             }
+            AgentEvent::ToolOutputDelta { id, text } => {
+                self.transcript.tool_output_delta(&id, &text);
+            }
             AgentEvent::ToolFinished { id, name, result } => {
                 let ToolOutput::Text(text) = &result.output;
                 let summary = (name == "web_search")
@@ -1148,20 +1172,21 @@ impl FrontendProjection {
             }
             AgentEvent::StatusSegments(mut segments) => {
                 segments.sort_by_key(|segment| std::cmp::Reverse(segment.priority));
+                if let Some(segment) = segments
+                    .iter()
+                    .find(|segment| transient_status(&segment.text))
+                {
+                    self.command_notice = Some(Notification::new(segment.text.clone()));
+                }
+                segments.retain(|segment| !transient_status(&segment.text));
                 self.status_segments = segments;
             }
-            AgentEvent::CommandHandled(result) => {
-                match result {
-                    Ok(notice) => {
-                        self.command_notice = notice
-                            .map(|message| (message, Instant::now() + COMMAND_NOTICE_DURATION));
-                    }
-                    Err(error) => self.command_error = Some(error),
+            AgentEvent::CommandHandled(result) => match result {
+                Ok(notice) => {
+                    self.command_notice = notice.map(Notification::new);
                 }
-                self.pause_elapsed_timer();
-                self.running = false;
-                self.interrupting = false;
-            }
+                Err(error) => self.command_error = Some(Notification::new(error)),
+            },
             AgentEvent::TurnDone(result) => {
                 if let Err(error) = result {
                     self.transcript.push_error(&format!("error: {error}"));
@@ -1289,126 +1314,141 @@ impl FrontendProjection {
     }
 
     fn visible_extensions(&self) -> Vec<&ExtensionSummary> {
-        let query = self.extension_search.to_ascii_lowercase();
         self.extensions
             .iter()
             .filter(|extension| match self.extension_tab {
-                ExtensionTab::Discover => !extension.installed,
-                ExtensionTab::Installed => extension.installed,
-                ExtensionTab::Updates => {
+                ExtensionTab::Discover => {
                     !extension.installed
-                        && self.extensions.iter().any(|installed| {
-                            installed.installed
-                                && installed.id == extension.id
-                                && same_extension_origin(&installed.origin, &extension.origin)
-                                && semver::Version::parse(&extension.version).ok()
-                                    > semver::Version::parse(&installed.version).ok()
-                        })
+                        && self
+                            .installing_extension
+                            .as_ref()
+                            .is_none_or(|(id, _)| id != extension.id.as_str())
+                        && !self
+                            .extensions
+                            .iter()
+                            .any(|installed| installed.installed && installed.id == extension.id)
                 }
-            })
-            .filter(|extension| {
-                query.is_empty()
-                    || extension.name.to_ascii_lowercase().contains(&query)
-                    || extension.id.as_str().to_ascii_lowercase().contains(&query)
-                    || extension.description.to_ascii_lowercase().contains(&query)
+                ExtensionTab::Installed => extension.installed,
             })
             .collect()
     }
 
+    pub(crate) fn begin_extension_operation(&mut self, operation: &ExtensionOperation) {
+        if let ExtensionOperation::Install { id, .. } = operation {
+            let name = self
+                .extensions
+                .iter()
+                .find(|extension| extension.id.as_str() == id)
+                .map_or_else(|| id.clone(), |extension| extension.name.clone());
+            self.installing_extension = Some((id.clone(), name));
+            self.extension_manager = self
+                .extension_manager
+                .map(|selected| selected.min(self.visible_extensions().len().saturating_sub(1)));
+        }
+    }
+
+    pub(crate) fn extension_operation_failed(&mut self) {
+        self.installing_extension = None;
+    }
+
+    pub(crate) fn extension_manager_height(&self) -> u16 {
+        const MAX_VISIBLE: usize = 3;
+
+        let Some(selected) = self.extension_manager else {
+            return 0;
+        };
+        let visible = self.visible_extensions();
+        let rows = visible.len().min(MAX_VISIBLE);
+        let mut height = if rows == 0 { 5 } else { rows * 3 + 4 };
+        if self.extension_details_visible
+            && let Some(extension) = visible.get(selected)
+        {
+            height += 1;
+            height += usize::from(!extension.commands.is_empty());
+            height += usize::from(!extension.capabilities.is_empty());
+        }
+        u16::try_from(height).unwrap_or(u16::MAX)
+    }
+
     pub(crate) fn render_extension_manager(&self, frame: &mut Frame, area: Rect) {
+        const MAX_VISIBLE: usize = 3;
+
         let Some(selected) = self.extension_manager else {
             return;
         };
-        let width = area.width.saturating_sub(8).min(90);
-        let height = area.height.saturating_sub(4).min(30);
-        let panel = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
-        frame.render_widget(Clear, panel);
-        let block = Block::default()
-            .title(" Extensions ")
-            .borders(Borders::ALL)
-            .padding(Padding::new(2, 2, 1, 1));
-        let inner = block.inner(panel);
-        frame.render_widget(block, panel);
-        let tabs = match self.extension_tab {
-            ExtensionTab::Discover => "[Discover]  Installed  Updates",
-            ExtensionTab::Installed => "Discover  [Installed]  Updates",
-            ExtensionTab::Updates => "Discover  Installed  [Updates]",
-        };
-        let mut lines = vec![
-            Line::from(tabs),
-            Line::styled(
-                format!("Search: {}_    ←→ tabs · Esc close", self.extension_search),
-                theme::dim(),
-            ),
-            Line::default(),
-        ];
-        if self.extension_disable_confirmation.is_some() {
-            lines.push(Line::styled(
-                "Any active autonomous work will be paused and unloaded. Press Enter to disable or Esc to cancel.",
-                theme::error(),
-            ));
-            lines.push(Line::default());
+        if area.height == 0 {
+            return;
         }
+        frame.render_widget(Block::default().style(theme::picker_bg()), area);
+        let mut lines = vec![extension_tabs_line(self.extension_tab), Line::default()];
         let visible = self.visible_extensions();
         if visible.is_empty() {
-            lines.push(Line::from("No matching extensions."));
+            lines.push(Line::styled("    No extensions", theme::picker_muted()));
         }
-        for (index, extension) in visible.into_iter().enumerate() {
-            let marker = if index == selected { "›" } else { " " };
-            let state = if self.extension_tab == ExtensionTab::Updates {
-                "Update available"
-            } else if !extension.installed {
-                "Not installed"
-            } else if extension.enabled {
-                "Enabled"
+        let start = if visible.len() > MAX_VISIBLE {
+            selected
+                .saturating_sub(MAX_VISIBLE - 1)
+                .min(visible.len() - MAX_VISIBLE)
+        } else {
+            0
+        };
+        for (index, extension) in visible.iter().enumerate().skip(start).take(MAX_VISIBLE) {
+            let is_selected = index == selected;
+            let marker = if is_selected { "  › " } else { "    " };
+            let style = if is_selected {
+                theme::picker_selected()
             } else {
-                "Disabled"
+                theme::picker_muted()
             };
+            lines.push(Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(
+                    format!(
+                        "{}  v{}{}",
+                        extension.name,
+                        extension.version,
+                        if extension.local_override {
+                            "  [override]"
+                        } else {
+                            ""
+                        }
+                    ),
+                    style,
+                ),
+            ]));
             let source = match &extension.origin {
-                tokio_agent_extension_api::ExtensionOrigin::OfficialRegistry { .. } => {
-                    "Official".to_owned()
+                tokio_agent_extension_api::ExtensionOrigin::Local { path }
+                    if extension.local_override =>
+                {
+                    format!(" · {}", compact_home_path(path))
                 }
-                tokio_agent_extension_api::ExtensionOrigin::ThirdPartyRegistry {
-                    registry, ..
-                } => format!("Third-party · {registry}"),
-                tokio_agent_extension_api::ExtensionOrigin::Local { .. } => "Local".to_owned(),
+                _ => String::new(),
             };
-            lines.push(Line::from(format!(
-                "{marker} {}  v{}",
-                extension.name, extension.version
-            )));
             lines.push(Line::styled(
-                format!("  {} · {source} · {state}", extension.id),
-                theme::dim(),
+                format!("      {}{source}", extension.id),
+                theme::picker_muted(),
             ));
-            lines.push(Line::from(format!("  {}", extension.description)));
-            if index == selected {
+            lines.push(Line::styled(
+                format!("      {}", extension.description),
+                theme::picker_muted(),
+            ));
+
+            if is_selected && self.extension_details_visible {
                 if !extension.commands.is_empty() {
                     lines.push(Line::styled(
-                        format!("  Commands: {}", extension.commands.join(", ")),
-                        theme::dim(),
+                        format!("      Commands: {}", extension.commands.join(", ")),
+                        theme::picker_muted(),
                     ));
                 }
-                if !extension.tools.is_empty() {
-                    lines.push(Line::styled(
-                        format!("  Model tools: {}", extension.tools.join(", ")),
-                        theme::dim(),
-                    ));
-                    lines.push(Line::styled(
-                        "  Context cost: tool schemas only while enabled/active",
-                        theme::dim(),
-                    ));
+                let context = if extension.tools.is_empty() {
+                    "none until invoked".to_owned()
                 } else {
-                    lines.push(Line::styled(
-                        "  Context cost: none until invoked",
-                        theme::dim(),
-                    ));
-                }
+                    format!("tools: {}", extension.tools.join(", "))
+                };
+                lines.push(Line::styled(
+                    format!("      Context cost: {context}"),
+                    theme::picker_muted(),
+                ));
                 if !extension.capabilities.is_empty() {
                     let permissions = extension
                         .capabilities
@@ -1417,14 +1457,20 @@ impl FrontendProjection {
                         .collect::<Vec<_>>()
                         .join(", ");
                     lines.push(Line::styled(
-                        format!("  Permissions: {permissions}"),
-                        theme::dim(),
+                        format!("      Permissions: {permissions}"),
+                        theme::picker_muted(),
                     ));
                 }
             }
-            lines.push(Line::default());
         }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+
+        let inner = Rect {
+            x: area.x,
+            y: area.y.saturating_add(1),
+            width: area.width,
+            height: area.height.saturating_sub(2),
+        };
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     pub(crate) fn render_footer(&self, frame: &mut Frame, area: Rect) {
@@ -1439,57 +1485,82 @@ impl FrontendProjection {
             self.context_window.filter(|_| self.context_usage_known),
             self.last_request_usage.input_tokens,
         );
-        let left = status_left(&left, &self.status_segments, &right, width);
+        let status = self
+            .active_command_notice()
+            .map(str::to_owned)
+            .or_else(|| status_text(&self.status_segments))
+            .or_else(|| {
+                self.installing_extension
+                    .as_ref()
+                    .map(|(_, name)| format!("Installing {name} extension"))
+            });
+        let left = status.map_or(left.clone(), |text| {
+            append_status_text(left, &text, &right, width)
+        });
         frame.render_widget(Paragraph::new(footer_line(&left, &right, width)), area);
     }
 }
 
-fn same_extension_origin(
-    left: &tokio_agent_extension_api::ExtensionOrigin,
-    right: &tokio_agent_extension_api::ExtensionOrigin,
-) -> bool {
-    match (left, right) {
-        (
-            tokio_agent_extension_api::ExtensionOrigin::OfficialRegistry { registry: left },
-            tokio_agent_extension_api::ExtensionOrigin::OfficialRegistry { registry: right },
-        ) => left == right,
-        (
-            tokio_agent_extension_api::ExtensionOrigin::ThirdPartyRegistry {
-                registry: left, ..
-            },
-            tokio_agent_extension_api::ExtensionOrigin::ThirdPartyRegistry {
-                registry: right, ..
-            },
-        ) => left == right,
-        (
-            tokio_agent_extension_api::ExtensionOrigin::Local { path: left },
-            tokio_agent_extension_api::ExtensionOrigin::Local { path: right },
-        ) => left == right,
-        _ => false,
+fn extension_tabs_line(selected: ExtensionTab) -> Line<'static> {
+    let style = |tab| {
+        if tab == selected {
+            theme::picker_selected()
+        } else {
+            theme::picker_muted()
+        }
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Discover", style(ExtensionTab::Discover)),
+        Span::raw("  "),
+        Span::styled("Installed", style(ExtensionTab::Installed)),
+    ])
+}
+
+fn compact_home_path(path: &str) -> String {
+    let path = std::path::Path::new(path);
+    let Some(home) = dirs::home_dir() else {
+        return path.to_string_lossy().into_owned();
+    };
+    let Ok(relative) = path.strip_prefix(home) else {
+        return path.to_string_lossy().into_owned();
+    };
+    if relative.as_os_str().is_empty() {
+        "~".to_owned()
+    } else {
+        format!("~/{}", relative.to_string_lossy())
     }
 }
 
-fn status_left(base: &str, segments: &[StatusSegment], right: &str, width: usize) -> String {
-    let mut left = base.to_owned();
+fn transient_status(text: &str) -> bool {
+    matches!(
+        text,
+        "goal: complete" | "goal: blocked" | "goal: cancelled" | "loop: stopped"
+    )
+}
+
+fn status_text(segments: &[StatusSegment]) -> Option<String> {
+    segments
+        .iter()
+        .find(|segment| !segment.text.contains(['\n', '\r', '\u{1b}']))
+        .map(|segment| segment.text.chars().take(160).collect())
+}
+
+fn append_status_text(left: String, text: &str, right: &str, width: usize) -> String {
     let reserved = right.width().saturating_add(2);
-    for segment in segments {
-        if segment.text.contains(['\n', '\r', '\u{1b}']) {
-            continue;
-        }
-        let text: String = segment.text.chars().take(160).collect();
-        let candidate = format!("{left}   [{text}]");
-        if candidate.width().saturating_add(reserved) <= width {
-            left = candidate;
-        }
+    let candidate = format!("{left}   [{text}]");
+    if candidate.width().saturating_add(reserved) <= width {
+        candidate
+    } else {
+        left
     }
-    left
 }
 
 fn extension_slash_command(descriptor: CommandDescriptor) -> SlashCommand {
     let source = match &descriptor.source {
         CommandSource::Extension { id, .. } => id.to_string(),
         CommandSource::Local { .. } => "Local command".to_owned(),
-        CommandSource::BuiltIn => "Built in".to_owned(),
+        CommandSource::BuiltIn => "tokio.core".to_owned(),
     };
     let action = match descriptor.id.as_str() {
         "tokio.builtin:clear" => SlashAction::Clear,
@@ -1499,16 +1570,13 @@ fn extension_slash_command(descriptor: CommandDescriptor) -> SlashCommand {
         "tokio.builtin:extensions" => SlashAction::Extensions,
         _ => SlashAction::Extension(descriptor.id),
     };
-    let description = if matches!(descriptor.source, CommandSource::BuiltIn) {
-        descriptor.description
-    } else {
-        format!("{} · {source}", descriptor.description)
-    };
     SlashCommand {
         name: Cow::Owned(descriptor.name),
-        description: Cow::Owned(description),
+        description: Cow::Owned(descriptor.description),
+        source: Cow::Owned(source),
         usage: descriptor.usage.map(Cow::Owned),
         action,
+        available_while_running: descriptor.available_while_running,
     }
 }
 
@@ -1628,6 +1696,16 @@ fn slash_command_name_width(commands: &[SlashCommand]) -> usize {
     commands
         .iter()
         .map(|command| command.name.width())
+        .max()
+        .unwrap_or_default()
+}
+
+fn slash_command_description_width(commands: &[SlashCommand], query: &str) -> usize {
+    commands
+        .iter()
+        .map(|command| {
+            slash_command_description(command, command_usage_visible(&command.name, query)).width()
+        })
         .max()
         .unwrap_or_default()
 }
@@ -1917,6 +1995,9 @@ fn truncate_start(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
     use super::*;
 
     fn builtin_descriptors() -> Vec<CommandDescriptor> {
@@ -1981,6 +2062,207 @@ mod tests {
             builtin_descriptors(),
             Vec::new(),
         )
+    }
+
+    fn extension(installed: bool) -> ExtensionSummary {
+        ExtensionSummary {
+            id: tokio_agent_extension_api::ExtensionId::new("example.extension"),
+            name: "Example".to_owned(),
+            version: "1.0.0".to_owned(),
+            description: "An example extension".to_owned(),
+            origin: tokio_agent_extension_api::ExtensionOrigin::OfficialRegistry {
+                registry: "official".to_owned(),
+            },
+            installed,
+            local_override: false,
+            capabilities: Vec::new(),
+            commands: Vec::new(),
+            tools: Vec::new(),
+            status_segments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn extension_tab_indicator_does_not_shift_labels() {
+        let expected = "  Discover  Installed";
+        for (tab, selected_span) in [(ExtensionTab::Discover, 1), (ExtensionTab::Installed, 3)] {
+            let line = extension_tabs_line(tab);
+            assert_eq!(line.to_string(), expected);
+            assert_eq!(line.spans[selected_span].style, theme::picker_selected());
+        }
+    }
+
+    #[test]
+    fn extension_manager_has_single_blank_row_between_tabs_and_items() {
+        let mut projection = projection();
+        projection.extensions.push(extension(false));
+        projection.extension_manager = Some(0);
+        projection.extension_tab = ExtensionTab::Discover;
+
+        let height = projection.extension_manager_height();
+        let backend = TestBackend::new(60, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| projection.render_extension_manager(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rows = (0..height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                "",
+                "  Discover  Installed",
+                "",
+                "  › Example  v1.0.0",
+                "      example.extension",
+                "      An example extension",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn local_override_paths_are_compacted_under_home() {
+        let home = dirs::home_dir().expect("test requires a home directory");
+        let path = home.join("code/extensions/goal");
+
+        assert_eq!(
+            compact_home_path(&path.to_string_lossy()),
+            "~/code/extensions/goal"
+        );
+        assert_eq!(
+            compact_home_path("/workspace/extensions/goal"),
+            "/workspace/extensions/goal"
+        );
+    }
+
+    #[test]
+    fn installed_extension_menu_labels_local_overrides() {
+        let mut local = extension(true);
+        local.local_override = true;
+        local.origin = tokio_agent_extension_api::ExtensionOrigin::Local {
+            path: "/workspace/registry/extensions/loop".into(),
+        };
+        let mut projection = projection();
+        projection.extensions.push(local);
+        projection.extension_manager = Some(0);
+
+        let height = projection.extension_manager_height();
+        let backend = TestBackend::new(100, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| projection.render_extension_manager(frame, frame.area()))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("[override]"));
+        assert!(rendered.contains("example.extension · /workspace/registry/extensions/loop"));
+    }
+
+    #[test]
+    fn extension_manager_exposes_install_and_uninstall_actions() {
+        let mut projection = projection();
+        projection.extensions.push(extension(true));
+        projection.extension_manager = Some(0);
+
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            FrontendEffect::Extension(ExtensionOperation::Uninstall { id })
+                if id == "example.extension"
+        ));
+
+        projection.extensions[0] = extension(false);
+        projection.extension_tab = ExtensionTab::Discover;
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            FrontendEffect::Extension(ExtensionOperation::Install { id, registry })
+                if id == "example.extension" && registry == "official"
+        ));
+    }
+
+    #[test]
+    fn installed_extensions_are_not_shown_in_discover() {
+        let mut projection = projection();
+        projection.extensions = vec![extension(false), extension(true)];
+        projection.extension_tab = ExtensionTab::Discover;
+
+        assert!(projection.visible_extensions().is_empty());
+    }
+
+    #[test]
+    fn installing_extension_disappears_from_discover_immediately() {
+        let mut projection = projection();
+        projection.extensions.push(extension(false));
+        projection.extension_tab = ExtensionTab::Discover;
+        projection.extension_manager = Some(0);
+        let operation = ExtensionOperation::Install {
+            id: "example.extension".to_owned(),
+            registry: "official".to_owned(),
+        };
+
+        projection.begin_extension_operation(&operation);
+
+        assert!(projection.visible_extensions().is_empty());
+        assert_eq!(
+            projection.installing_extension,
+            Some(("example.extension".to_owned(), "Example".to_owned()))
+        );
+        assert!(
+            append_status_text("session".to_owned(), "Installing Example extension", "", 80,)
+                .contains("[Installing Example extension]")
+        );
+
+        projection.extension_operation_failed();
+        assert_eq!(projection.visible_extensions().len(), 1);
+    }
+
+    #[test]
+    fn extension_manager_stays_open_after_session_update() {
+        let mut projection = projection();
+        projection.extensions.push(extension(true));
+        projection.extension_manager = Some(0);
+
+        projection.update_session(
+            String::new(),
+            String::new(),
+            None,
+            String::new(),
+            None,
+            0,
+            Mode::Suggest,
+            builtin_descriptors(),
+            vec![extension(false)],
+        );
+
+        assert_eq!(projection.extension_manager, Some(0));
+    }
+
+    #[test]
+    fn extension_details_are_only_shown_on_request() {
+        let mut projection = projection();
+        projection.extensions.push(extension(true));
+        projection.extension_manager = Some(0);
+        let compact_height = projection.extension_manager_height();
+
+        projection.on_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+
+        assert!(projection.extension_details_visible);
+        assert!(projection.extension_manager_height() > compact_height);
     }
 
     #[test]
@@ -2073,6 +2355,37 @@ mod tests {
         assert!(projection.composer.text().is_empty());
         assert!(projection.quit_confirmation_active());
         assert!(matches!(projection.on_key(ctrl_c), FrontendEffect::Quit));
+    }
+
+    #[test]
+    fn ctrl_c_dismisses_every_projection_menu() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        let mut projection = projection();
+        projection.extension_manager = Some(0);
+        projection.extension_details_visible = true;
+        assert!(matches!(projection.on_key(ctrl_c), FrontendEffect::None));
+        assert!(projection.extension_manager.is_none());
+        assert!(!projection.extension_details_visible);
+
+        projection.permissions_selected = Some(0);
+        assert!(matches!(projection.on_key(ctrl_c), FrontendEffect::None));
+        assert!(projection.permissions_selected.is_none());
+
+        projection.setting_picker = Some(SettingPicker::Model(0));
+        assert!(matches!(projection.on_key(ctrl_c), FrontendEffect::None));
+        assert!(projection.setting_picker.is_none());
+
+        projection.composer.replace("/model");
+        assert!(matches!(projection.on_key(ctrl_c), FrontendEffect::None));
+        assert!(projection.composer.text().is_empty());
+
+        projection.provider_change_notice = true;
+        assert!(matches!(
+            projection.on_key(ctrl_c),
+            FrontendEffect::ConfigureProvider
+        ));
+        assert!(!projection.provider_change_notice);
     }
 
     #[test]
@@ -2266,6 +2579,96 @@ mod tests {
     }
 
     #[test]
+    fn slash_command_sources_use_an_aligned_two_space_gutter() {
+        let descriptor = |name: &str, description: &str, source: &str| CommandDescriptor {
+            id: CommandId::new(format!("{source}:{}", name.trim_start_matches('/'))),
+            name: name.to_owned(),
+            description: description.to_owned(),
+            usage: None,
+            source: CommandSource::Extension {
+                id: tokio_agent_extension_api::ExtensionId::new(source),
+                version: "1.0.0".to_owned(),
+            },
+            available_while_running: false,
+        };
+        let mut projection = projection();
+        projection.extension_commands = vec![
+            extension_slash_command(descriptor("/goal", "Longer description", "tokio.goal")),
+            extension_slash_command(descriptor("/loop", "Short", "tokio.loop")),
+        ];
+        projection.composer.replace("/");
+
+        let height = projection.slash_picker_height();
+        let backend = TestBackend::new(60, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| projection.render_slash_picker(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rows,
+            [
+                "",
+                "› /goal  Longer description  tokio.goal",
+                "  /loop  Short               tokio.loop",
+                "",
+            ]
+        );
+        for x in 0..buffer.area.width {
+            let cell = buffer.cell((x, 1)).unwrap();
+            if !cell.symbol().trim().is_empty() {
+                assert!(
+                    cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                    "selected cell at column {x} was not bold"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_slash_command_match_is_not_bold() {
+        let mut projection = projection();
+        projection.composer.replace("/providers");
+
+        let height = projection.slash_picker_height();
+        let backend = TestBackend::new(70, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| projection.render_slash_picker(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = (0..buffer.area.width)
+            .map(|x| buffer.cell((x, 1)).unwrap().symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_owned();
+
+        assert_eq!(
+            row,
+            "› /providers  Connect or switch AI providers  tokio.core"
+        );
+        for x in 0..buffer.area.width {
+            let cell = buffer.cell((x, 1)).unwrap();
+            if !cell.symbol().trim().is_empty() {
+                assert!(
+                    !cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                    "single matching command cell at column {x} was bold"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn autonomy_command_descriptions_show_usage_only_when_fully_typed() {
         let projection = projection();
         let goal = projection
@@ -2279,6 +2682,12 @@ mod tests {
             .find(|command| command.name == "/loop")
             .expect("loop command");
 
+        assert!(
+            projection
+                .extension_commands
+                .iter()
+                .all(|command| command.source == "tokio.core")
+        );
         assert_eq!(
             slash_command_description(goal, false),
             "Keep working autonomously until an objective is complete"
@@ -2319,15 +2728,109 @@ mod tests {
             FrontendEffect::Command(UiCommand::InvokeCommand { id, arguments })
                 if id.as_str() == "local.project.review:review" && arguments == "tests"
         ));
+        assert_eq!(projection.transcript.len(), 0);
+        assert!(!projection.running);
 
         projection.running = false;
         projection.composer.replace("/typo");
         assert!(matches!(projection.submit(), FrontendEffect::None));
         assert_eq!(
-            projection.command_error.as_deref(),
+            projection.active_command_error(),
             Some("Unknown command: /typo")
         );
         assert_eq!(projection.composer.text(), "/typo");
+    }
+
+    #[test]
+    fn rejected_extension_commands_always_close_the_usage_palette() {
+        let mut unavailable = projection();
+        unavailable.running = true;
+        unavailable.composer.replace("/goal run ls");
+
+        assert!(matches!(unavailable.submit(), FrontendEffect::None));
+        assert_eq!(unavailable.composer.text(), "");
+        assert!(unavailable.slash_display_matches().is_empty());
+        assert_eq!(
+            unavailable.active_command_error(),
+            Some("/goal is unavailable while a turn is running")
+        );
+
+        let mut autonomy_conflict = projection();
+        autonomy_conflict.composer.replace("/goal run ls");
+        assert!(matches!(
+            autonomy_conflict.submit(),
+            FrontendEffect::Command(UiCommand::InvokeCommand { .. })
+        ));
+        autonomy_conflict.apply(AgentEvent::CommandHandled(Err(
+            "another extension owns autonomous work".into(),
+        )));
+        assert_eq!(autonomy_conflict.composer.text(), "");
+        assert!(autonomy_conflict.slash_display_matches().is_empty());
+        assert_eq!(
+            autonomy_conflict.active_command_error(),
+            Some("another extension owns autonomous work")
+        );
+
+        unavailable.command_error.as_mut().unwrap().expires_at = Instant::now();
+        autonomy_conflict.command_error.as_mut().unwrap().expires_at = Instant::now();
+        assert_eq!(unavailable.active_command_error(), None);
+        assert_eq!(unavailable.command_feedback_height(), 0);
+        assert_eq!(autonomy_conflict.active_command_error(), None);
+        assert_eq!(autonomy_conflict.command_feedback_height(), 0);
+    }
+
+    #[test]
+    fn extensions_command_shows_notice_when_invoked_while_running() {
+        let mut projection = projection();
+        projection
+            .extension_commands
+            .push(extension_slash_command(CommandDescriptor {
+                id: CommandId::new("tokio.builtin:extensions"),
+                name: "/extensions".into(),
+                description: "Manage installed extensions".into(),
+                usage: None,
+                source: CommandSource::BuiltIn,
+                available_while_running: true,
+            }));
+        projection.running = true;
+        projection.composer.replace("/extensions");
+
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            FrontendEffect::None
+        ));
+        assert_eq!(projection.composer.text(), "");
+        assert_eq!(
+            projection.active_command_error(),
+            Some("/extensions is unavailable while a turn is running")
+        );
+        assert!(projection.extension_manager.is_none());
+    }
+
+    #[test]
+    fn commands_marked_available_while_running_can_be_invoked() {
+        let mut projection = projection();
+        let loop_command = projection
+            .extension_commands
+            .iter_mut()
+            .find(|command| command.name == "/loop")
+            .expect("loop command");
+        loop_command.available_while_running = true;
+        projection.running = true;
+        projection.composer.replace("/loop cancel");
+
+        assert!(matches!(
+            projection.submit(),
+            FrontendEffect::Command(UiCommand::InvokeCommand { id, arguments })
+                if id.as_str() == "tokio.builtin:loop" && arguments == "cancel"
+        ));
+        assert!(projection.running);
+        assert_eq!(projection.transcript.len(), 0);
+        assert_eq!(projection.command_error, None);
+
+        projection.apply(AgentEvent::CommandHandled(Ok(None)));
+        assert!(projection.running);
+        assert_eq!(projection.transcript.len(), 0);
     }
 
     #[test]
@@ -2369,17 +2872,16 @@ mod tests {
             FrontendEffect::Command(UiCommand::InvokeCommand { id, arguments })
                 if id.as_str() == "tokio.builtin:loop" && arguments == "."
         ));
+        assert_eq!(projection.transcript.len(), 0);
         projection.apply(AgentEvent::CommandHandled(Err("Invalid interval".into())));
-        assert_eq!(
-            projection.command_error.as_deref(),
-            Some("Invalid interval")
-        );
+        assert_eq!(projection.active_command_error(), Some("Invalid interval"));
+        assert_eq!(projection.transcript.len(), 0);
         assert_eq!(projection.command_feedback_height(), 2);
         assert!(!projection.running);
     }
 
     #[test]
-    fn goal_and_loop_commands_show_temporary_success_notices() {
+    fn goal_and_loop_commands_show_temporary_footer_notices() {
         for (input, expected) in [
             ("/goal finish the migration", "Goal started"),
             ("/goal cancel", "Goal cancelled"),
@@ -2394,16 +2896,53 @@ mod tests {
             assert!(matches!(projection.submit(), FrontendEffect::Command(_)));
             projection.apply(AgentEvent::CommandHandled(Ok(Some(expected.to_owned()))));
             assert_eq!(projection.active_command_notice(), Some(expected));
-            assert_eq!(projection.command_feedback_height(), 2);
+            assert_eq!(projection.command_feedback_height(), 0);
 
             projection
                 .command_notice
                 .as_mut()
                 .expect("command notice")
-                .1 = Instant::now();
+                .expires_at = Instant::now();
             assert_eq!(projection.active_command_notice(), None);
             assert_eq!(projection.command_feedback_height(), 0);
         }
+    }
+
+    #[test]
+    fn terminal_statuses_share_the_temporary_notice_slot() {
+        let segment = |text: &str, priority| StatusSegment {
+            id: text.to_owned(),
+            text: text.to_owned(),
+            tone: tokio_agent_extension_api::StatusTone::Normal,
+            side: tokio_agent_extension_api::StatusSide::Left,
+            priority,
+            min_width: 0,
+        };
+        let mut projection = projection();
+        projection.apply(AgentEvent::StatusSegments(vec![
+            segment("loop: stopped", 90),
+            segment("goal: complete", 100),
+        ]));
+
+        assert_eq!(projection.active_command_notice(), Some("goal: complete"));
+        assert!(projection.status_segments.is_empty());
+        projection.command_notice.as_mut().unwrap().expires_at = Instant::now();
+        assert_eq!(projection.active_command_notice(), None);
+    }
+
+    #[test]
+    fn status_bar_uses_only_the_highest_priority_valid_segment() {
+        let segment = |text: &str| StatusSegment {
+            id: text.to_owned(),
+            text: text.to_owned(),
+            tone: tokio_agent_extension_api::StatusTone::Normal,
+            side: tokio_agent_extension_api::StatusSide::Left,
+            priority: 0,
+            min_width: 0,
+        };
+        let segments = vec![segment("goal: active"), segment("loop: every 10s")];
+
+        assert_eq!(status_text(&segments).as_deref(), Some("goal: active"));
     }
 
     #[test]
@@ -2722,6 +3261,38 @@ mod tests {
             projection.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
         assert_eq!(projection.slash_picker_height(), 0);
+    }
+
+    #[test]
+    fn single_match_palette_allows_history_navigation() {
+        let mut projection = projection();
+        projection.history.push("previous prompt".to_owned());
+        projection.composer.replace("/providers");
+        assert_eq!(projection.slash_matches().len(), 1);
+
+        projection.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(projection.composer.text(), "previous prompt");
+
+        projection.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(projection.composer.text(), "/providers");
+    }
+
+    #[test]
+    fn up_arrow_recalls_recently_run_slash_commands() {
+        let mut projection = projection();
+        projection.composer.replace("/cl");
+
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            FrontendEffect::Command(UiCommand::Clear)
+        ));
+        assert_eq!(
+            projection.take_history_entry_to_persist().as_deref(),
+            Some("/clear")
+        );
+
+        projection.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(projection.composer.text(), "/clear");
     }
 
     #[test]

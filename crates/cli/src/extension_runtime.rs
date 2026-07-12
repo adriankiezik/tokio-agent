@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 
 use tokio_agent_core::{DynamicToolCatalog, SessionHookEffect, Tool, ToolCtx, ToolDef, ToolResult};
 use tokio_agent_extension_api::{CommandId, ExtensionId, SessionEvent, ToolId};
@@ -16,8 +17,10 @@ pub struct ProgrammablePackage {
 #[derive(Clone)]
 pub struct ExtensionRuntime {
     tx: mpsc::Sender<Request>,
-    commands: Arc<BTreeMap<CommandId, CommandTarget>>,
-    tools: Arc<BTreeMap<(ExtensionId, String), String>>,
+    generations: Arc<RwLock<BTreeMap<ExtensionId, u64>>>,
+    initializing: Arc<AtomicBool>,
+    startup_replies: Arc<Mutex<Vec<mpsc::Receiver<Vec<SupervisorEffect>>>>>,
+    tools: Arc<RwLock<BTreeMap<(ExtensionId, String), String>>>,
     dynamic: DynamicToolCatalog,
     registered: Arc<Mutex<BTreeMap<ToolId, String>>>,
     pending: Arc<Mutex<Vec<SessionHookEffect>>>,
@@ -32,7 +35,7 @@ struct CommandTarget {
 
 enum Request {
     Command {
-        target: CommandTarget,
+        id: CommandId,
         arguments: String,
         reply: mpsc::Sender<anyhow::Result<Vec<SupervisorEffect>>>,
     },
@@ -42,6 +45,10 @@ enum Request {
     },
     Poll {
         reply: mpsc::Sender<Vec<SupervisorEffect>>,
+    },
+    Load {
+        packages: Vec<ProgrammablePackage>,
+        reply: mpsc::Sender<anyhow::Result<()>>,
     },
     Tool {
         extension: ExtensionId,
@@ -56,12 +63,12 @@ impl ExtensionRuntime {
     pub fn start(
         packages: Vec<ProgrammablePackage>,
         dynamic: DynamicToolCatalog,
-    ) -> anyhow::Result<Option<Self>> {
-        if packages.is_empty() {
-            return Ok(None);
-        }
+    ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel();
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let generations = Arc::new(RwLock::new(BTreeMap::new()));
+        let worker_generations = Arc::clone(&generations);
+        let initializing = Arc::new(AtomicBool::new(true));
+        let worker_initializing = Arc::clone(&initializing);
         let mut tool_handlers = BTreeMap::new();
         for package in &packages {
             let extension = ExtensionId::new(&package.manifest.id);
@@ -76,12 +83,14 @@ impl ExtensionRuntime {
                     .enable_all()
                     .build();
                 let Ok(runtime) = runtime else {
-                    let _ = ready_tx.send(Err(anyhow::anyhow!("starting extension runtime")));
+                    worker_initializing.store(false, Ordering::Release);
                     return;
                 };
                 runtime.block_on(async move {
                     let mut supervisor = SessionSupervisor::new(SupervisorPolicy::default());
                     let mut commands = BTreeMap::new();
+                    let mut startup_error = None;
+                    let mut loaded_generations = BTreeMap::new();
                     for package in packages {
                         match supervisor
                             .enable_programmable(
@@ -93,6 +102,7 @@ impl ExtensionRuntime {
                         {
                             Ok(generation) => {
                                 let extension = ExtensionId::new(&package.manifest.id);
+                                loaded_generations.insert(extension.clone(), generation);
                                 for command in package
                                     .manifest
                                     .commands
@@ -113,30 +123,39 @@ impl ExtensionRuntime {
                                 }
                             }
                             Err(error) => {
-                                let _ = ready_tx.send(Err(anyhow::Error::new(error)));
-                                return;
+                                startup_error = Some(error.to_string());
+                                break;
                             }
                         }
                     }
-                    if ready_tx.send(Ok(commands)).is_err() {
-                        return;
-                    }
+                    *worker_generations
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        loaded_generations.clone();
+                    worker_initializing.store(false, Ordering::Release);
+                    let mut startup_error_reported = false;
                     while let Ok(request) = rx.recv() {
                         match request {
                             Request::Command {
-                                target,
+                                id,
                                 arguments,
                                 reply,
                             } => {
-                                let result = supervisor
-                                    .invoke_programmable_command(
-                                        target.extension,
-                                        target.generation,
-                                        target.handler,
-                                        arguments,
-                                    )
-                                    .await
-                                    .map_err(anyhow::Error::new);
+                                let result = if let Some(error) = &startup_error {
+                                    Err(anyhow::anyhow!(error.clone()))
+                                } else if let Some(target) = commands.get(&id).cloned() {
+                                    supervisor
+                                        .invoke_programmable_command(
+                                            target.extension,
+                                            target.generation,
+                                            target.handler,
+                                            arguments,
+                                        )
+                                        .await
+                                        .map_err(anyhow::Error::new)
+                                } else {
+                                    Err(anyhow::anyhow!("unknown programmable command `{id}`"))
+                                };
                                 if let Ok(effects) = &result {
                                     for effect in effects {
                                         if let SupervisorEffect::SubmitPrompt {
@@ -152,15 +171,25 @@ impl ExtensionRuntime {
                                 let _ = reply.send(result);
                             }
                             Request::Event { event, reply } => {
-                                let effects: Vec<_> = supervisor
-                                    .broadcast(event)
-                                    .await
-                                    .into_iter()
-                                    .map(|result| result.unwrap_or_else(|error| SupervisorEffect::Notice {
+                                let effects: Vec<_> = if let Some(error) = &startup_error
+                                    && !startup_error_reported
+                                {
+                                    startup_error_reported = true;
+                                    vec![SupervisorEffect::Notice {
+                                        level: tokio_agent_extension_api::NoticeLevel::Error,
+                                        text: format!("Extension failed to start: {error}"),
+                                    }]
+                                } else {
+                                    supervisor
+                                        .broadcast(event)
+                                        .await
+                                        .into_iter()
+                                        .map(|result| result.unwrap_or_else(|error| SupervisorEffect::Notice {
                                         level: tokio_agent_extension_api::NoticeLevel::Error,
                                         text: format!("Extension stopped: {error}"),
-                                    }))
-                                    .collect();
+                                        }))
+                                        .collect()
+                                };
                                 for effect in &effects {
                                     if let SupervisorEffect::SubmitPrompt {
                                         automatic: true,
@@ -200,6 +229,60 @@ impl ExtensionRuntime {
                                 }
                                 let _ = reply.send(effects);
                             }
+                            Request::Load { packages, reply } => {
+                                let mut result = Ok(());
+                                for package in packages {
+                                    let extension = ExtensionId::new(&package.manifest.id);
+                                    if loaded_generations.contains_key(&extension) {
+                                        continue;
+                                    }
+                                    match supervisor
+                                        .enable_programmable(
+                                            &package.manifest,
+                                            &package.root,
+                                            Default::default(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(generation) => {
+                                            loaded_generations
+                                                .insert(extension.clone(), generation);
+                                            worker_generations
+                                                .write()
+                                                .unwrap_or_else(
+                                                    std::sync::PoisonError::into_inner,
+                                                )
+                                                .insert(extension.clone(), generation);
+                                            for command in package
+                                                .manifest
+                                                .commands
+                                                .iter()
+                                                .filter(|command| command.handler.is_some())
+                                            {
+                                                commands.insert(
+                                                    CommandId::new(format!(
+                                                        "{}:{}",
+                                                        package.manifest.id, command.name
+                                                    )),
+                                                    CommandTarget {
+                                                        extension: extension.clone(),
+                                                        generation,
+                                                        handler: command
+                                                            .handler
+                                                            .clone()
+                                                            .expect("filtered"),
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            result = Err(anyhow::Error::new(error));
+                                            break;
+                                        }
+                                    }
+                                }
+                                let _ = reply.send(result);
+                            }
                             Request::Tool {
                                 extension,
                                 generation,
@@ -207,12 +290,16 @@ impl ExtensionRuntime {
                                 arguments,
                                 reply,
                             } => {
-                                let result = supervisor
-                                    .invoke_programmable_tool(
-                                        extension, generation, handler, arguments,
-                                    )
-                                    .await
-                                    .map_err(anyhow::Error::new);
+                                let result = if let Some(error) = &startup_error {
+                                    Err(anyhow::anyhow!(error.clone()))
+                                } else {
+                                    supervisor
+                                        .invoke_programmable_tool(
+                                            extension, generation, handler, arguments,
+                                        )
+                                        .await
+                                        .map_err(anyhow::Error::new)
+                                };
                                 if let Ok(result) = &result {
                                     for effect in &result.effects {
                                         if let SupervisorEffect::SubmitPrompt {
@@ -232,19 +319,35 @@ impl ExtensionRuntime {
                     supervisor.shutdown().await;
                 });
             })?;
-        let commands = Arc::new(
-            ready_rx
-                .recv()
-                .map_err(|_| anyhow::anyhow!("extension supervisor stopped during startup"))??,
-        );
-        Ok(Some(Self {
+        Ok(Self {
             tx,
-            commands,
-            tools: Arc::new(tool_handlers),
+            generations,
+            initializing,
+            startup_replies: Arc::new(Mutex::new(Vec::new())),
+            tools: Arc::new(RwLock::new(tool_handlers)),
             dynamic,
             registered: Arc::new(Mutex::new(BTreeMap::new())),
             pending: Arc::new(Mutex::new(Vec::new())),
-        }))
+        })
+    }
+
+    pub fn load(&self, packages: Vec<ProgrammablePackage>) -> anyhow::Result<()> {
+        {
+            let mut tools = self
+                .tools
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for package in &packages {
+                let extension = ExtensionId::new(&package.manifest.id);
+                for tool in &package.manifest.tools {
+                    tools.insert((extension.clone(), tool.name.clone()), tool.handler.clone());
+                }
+            }
+        }
+        let (reply, receive) = mpsc::channel();
+        self.tx.send(Request::Load { packages, reply })?;
+        receive.recv()??;
+        Ok(())
     }
 
     pub fn route(
@@ -252,12 +355,9 @@ impl ExtensionRuntime {
         id: &CommandId,
         arguments: String,
     ) -> anyhow::Result<Option<(String, bool)>> {
-        let Some(target) = self.commands.get(id).cloned() else {
-            return Ok(None);
-        };
         let (reply, receive) = mpsc::channel();
         self.tx.send(Request::Command {
-            target,
+            id: id.clone(),
             arguments,
             reply,
         })?;
@@ -279,9 +379,23 @@ impl ExtensionRuntime {
     }
 
     pub fn event(&self, event: SessionEvent) -> Vec<SessionHookEffect> {
+        let is_session_start = matches!(event, SessionEvent::SessionStarted);
         let (reply, receive) = mpsc::channel();
         if self.tx.send(Request::Event { event, reply }).is_err() {
             return Vec::new();
+        }
+        if self.initializing.load(Ordering::Acquire) {
+            self.startup_replies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(receive);
+            return if is_session_start {
+                vec![SessionHookEffect::StatusSegments(vec![
+                    initializing_status_segment(),
+                ])]
+            } else {
+                Vec::new()
+            };
         }
         let mut effects = std::mem::take(
             &mut *self
@@ -294,16 +408,44 @@ impl ExtensionRuntime {
     }
 
     pub fn poll(&self) -> Vec<SessionHookEffect> {
-        let (reply, receive) = mpsc::channel();
-        if self.tx.send(Request::Poll { reply }).is_err() {
-            return Vec::new();
-        }
         let mut effects = std::mem::take(
             &mut *self
                 .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        let mut startup_replies = self
+            .startup_replies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let had_startup_replies = !startup_replies.is_empty();
+        let mut waiting = Vec::new();
+        for receive in startup_replies.drain(..) {
+            match receive.try_recv() {
+                Ok(startup_effects) => effects.extend(self.process_effects(startup_effects)),
+                Err(mpsc::TryRecvError::Empty) => waiting.push(receive),
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        *startup_replies = waiting;
+        let waiting_for_startup_events = !startup_replies.is_empty();
+        drop(startup_replies);
+
+        if self.initializing.load(Ordering::Acquire) || waiting_for_startup_events {
+            return effects;
+        }
+        if had_startup_replies
+            && !effects
+                .iter()
+                .any(|effect| matches!(effect, SessionHookEffect::StatusSegments(_)))
+        {
+            effects.push(SessionHookEffect::StatusSegments(Vec::new()));
+        }
+
+        let (reply, receive) = mpsc::channel();
+        if self.tx.send(Request::Poll { reply }).is_err() {
+            return effects;
+        }
         effects.extend(self.process_effects(receive.recv().unwrap_or_default()));
         effects
     }
@@ -329,12 +471,20 @@ impl ExtensionRuntime {
                 }
                 SupervisorEffect::RegisterTool(descriptor) => {
                     let key = (descriptor.owner.clone(), descriptor.name.clone());
-                    if let Some(handler) = self.tools.get(&key).cloned() {
+                    if let Some(handler) = self
+                        .tools
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&key)
+                        .cloned()
+                    {
                         let generation = self
-                            .commands
-                            .values()
-                            .find(|target| target.extension == descriptor.owner)
-                            .map_or(1, |target| target.generation);
+                            .generations
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get(&descriptor.owner)
+                            .copied()
+                            .unwrap_or(1);
                         let name = descriptor.name.clone();
                         let tool = Arc::new(ExtensionTool {
                             descriptor: descriptor.clone(),
@@ -369,6 +519,17 @@ impl ExtensionRuntime {
             }
         }
         output
+    }
+}
+
+fn initializing_status_segment() -> tokio_agent_extension_api::StatusSegment {
+    tokio_agent_extension_api::StatusSegment {
+        id: "tokio-agent:extensions-initializing".to_owned(),
+        text: "Initializing extensions…".to_owned(),
+        tone: tokio_agent_extension_api::StatusTone::Muted,
+        side: tokio_agent_extension_api::StatusSide::Right,
+        priority: i16::MAX,
+        min_width: 24,
     }
 }
 

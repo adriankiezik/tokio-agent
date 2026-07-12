@@ -16,6 +16,8 @@ pub enum CompanionError {
     Io(#[from] std::io::Error),
     #[error("extension companion protocol failed: {0}")]
     Protocol(String),
+    #[error("extension host rejected the request: {0}")]
+    Host(String),
     #[error("extension companion exited")]
     Exited,
     #[error("extension companion did not respond before its protocol deadline")]
@@ -31,10 +33,9 @@ struct RunningCompanion {
 }
 
 /// Lazy, session-scoped companion lifecycle. The process receives an empty
-/// environment and piped protocol values only; declarative extensions never
-/// require this manager to be started.
 pub struct CompanionManager {
     executable: Option<PathBuf>,
+    cache_directory: Option<PathBuf>,
     running: Option<RunningCompanion>,
     restarted: bool,
     circuit_open: bool,
@@ -46,6 +47,7 @@ impl Default for CompanionManager {
     fn default() -> Self {
         Self {
             executable: locate_companion().ok(),
+            cache_directory: dirs::cache_dir().map(|path| path.join("tokio-agent/wasmtime")),
             running: None,
             restarted: false,
             circuit_open: false,
@@ -92,6 +94,9 @@ impl CompanionManager {
                 Err(error)
             }
         }?;
+        if let HostResponse::Error { message, .. } = &response {
+            return Err(CompanionError::Host(message.clone()));
+        }
         match (request, &response) {
             (HostRequest::Load { extension, .. }, HostResponse::Loaded { .. }) => {
                 self.loads.insert(extension.clone(), request.clone());
@@ -181,8 +186,12 @@ impl CompanionManager {
             return Ok(());
         }
         let executable = self.executable.as_ref().ok_or(CompanionError::NotFound)?;
-        let mut child = Command::new(executable)
-            .env_clear()
+        let mut command = Command::new(executable);
+        command.env_clear();
+        if let Some(cache_directory) = &self.cache_directory {
+            command.arg("--cache-dir").arg(cache_directory);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

@@ -62,6 +62,7 @@ pub enum ActionOutcome {
     Steering(String),
     Notice,
     StatusUpdated(StatusSegment),
+    StatusCleared(String),
     ToolRegistered,
     ToolUnregistered,
     TimerScheduled { id: TimerId, after: Duration },
@@ -292,6 +293,14 @@ fn apply_action(
                 .collect();
             status.insert((owner.clone(), segment.id.clone()), segment.clone());
             Ok(ActionOutcome::StatusUpdated(segment))
+        }
+        ExtensionAction::ClearStatusSegment(id) => {
+            require(state, Capability::StatusWrite)?;
+            if id.is_empty() {
+                return Err(ActionError::InvalidStatus);
+            }
+            status.remove(&(owner.clone(), id.clone()));
+            Ok(ActionOutcome::StatusCleared(id))
         }
         ExtensionAction::RegisterTool(_) => {
             require(state, Capability::ToolsDynamic)?;

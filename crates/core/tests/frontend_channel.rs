@@ -139,8 +139,9 @@ impl Tool for RunningTool {
         }
     }
 
-    fn run<'a>(&'a self, _input: Value, _ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {
+    fn run<'a>(&'a self, _input: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {
         self.runs.fetch_add(1, Ordering::SeqCst);
+        ctx.report_progress("streamed output");
         Box::pin(async { ToolResult::ok("total 0") })
     }
 }
@@ -162,11 +163,13 @@ async fn run_turn_collecting(
             AgentEvent::TextDelta(_) => seq.push("text"),
             AgentEvent::ThinkingDelta(_) => seq.push("thinking"),
             AgentEvent::ToolStarted { .. } => seq.push("tool_start"),
+            AgentEvent::ToolOutputDelta { .. } => seq.push("tool_output"),
             AgentEvent::ToolFinished { .. } => seq.push("tool_result"),
             AgentEvent::TurnUsage(_) => seq.push("usage"),
             AgentEvent::RequestUsage(_)
             | AgentEvent::StatusSegments(_)
             | AgentEvent::CommandCatalog(_)
+            | AgentEvent::ExtensionCatalog(_)
             | AgentEvent::CommandHandled(_) => {}
             AgentEvent::PermissionNeeded { id, .. } => {
                 seq.push("permission");
@@ -273,7 +276,14 @@ async fn permission_prompt_flows_over_the_channel_and_allow_always_is_remembered
         run_turn_collecting(&command_tx, &mut event_rx, "run ls", Decision::AllowAlways).await;
     assert_eq!(
         first,
-        vec!["text", "tool_start", "permission", "tool_result", "done"],
+        vec![
+            "text",
+            "tool_start",
+            "permission",
+            "tool_output",
+            "tool_result",
+            "done"
+        ],
         "first turn must prompt for permission before running the tool"
     );
     assert_eq!(
@@ -286,7 +296,7 @@ async fn permission_prompt_flows_over_the_channel_and_allow_always_is_remembered
         run_turn_collecting(&command_tx, &mut event_rx, "run ls again", Decision::Deny).await;
     assert_eq!(
         second,
-        vec!["text", "tool_start", "tool_result", "done"],
+        vec!["text", "tool_start", "tool_output", "tool_result", "done"],
         "an allow-always decision must suppress the second permission prompt"
     );
     assert_eq!(
@@ -788,7 +798,9 @@ async fn unexpected_interrupted_done_preserves_partial_message_without_executing
         .unwrap();
     loop {
         match event_rx.recv().await.unwrap() {
-            AgentEvent::ToolStarted { .. } | AgentEvent::ToolFinished { .. } => {
+            AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolOutputDelta { .. }
+            | AgentEvent::ToolFinished { .. } => {
                 panic!("partial tool calls must never execute")
             }
             AgentEvent::TurnDone(result) => {
@@ -1026,7 +1038,9 @@ async fn partial_transport_failure_is_preserved_closed_and_never_retried_or_exec
     assert!(!events.iter().any(|event| {
         matches!(
             event,
-            AgentEvent::ToolStarted { .. } | AgentEvent::ToolFinished { .. }
+            AgentEvent::ToolStarted { .. }
+                | AgentEvent::ToolOutputDelta { .. }
+                | AgentEvent::ToolFinished { .. }
         )
     }));
 }

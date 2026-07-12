@@ -112,6 +112,21 @@ impl Transcript {
         self.tool_result_with_summary(id, is_error, text, None);
     }
 
+    pub(super) fn tool_output_delta(&mut self, id: &ToolCallId, text: &str) {
+        if let Some(Cell::Tool {
+            result,
+            total_lines,
+            ..
+        }) = self
+            .cells
+            .iter_mut()
+            .find(|cell| matches!(cell, Cell::Tool { id: cell_id, .. } if cell_id == id))
+        {
+            result.extend(text.lines().map(str::to_owned));
+            *total_lines = result.len();
+        }
+    }
+
     pub(super) fn tool_result_with_summary(
         &mut self,
         id: &ToolCallId,
@@ -657,6 +672,22 @@ mod tests {
                 status: ToolStatus::Running,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn running_tool_accepts_incremental_output() {
+        let mut transcript = Transcript::new();
+        transcript.tool_start(id("a"), "bash".into(), "build".into());
+        transcript.tool_output_delta(&id("a"), "compiling\nlinking\n");
+        assert!(matches!(
+            &transcript.cells[0],
+            Cell::Tool {
+                status: ToolStatus::Running,
+                result,
+                total_lines: 2,
+                ..
+            } if result == &["compiling", "linking"]
         ));
     }
 

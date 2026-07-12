@@ -9,10 +9,10 @@ use tokio_agent_extension_api::{
     StatusSide, StatusTone, ToolDescriptor, ToolId, ToolPermission,
 };
 use tokio_agent_plugin::{
-    ActionError, ActionOutcome, CommandRouter, Enablement, ExtensionConfig, ExtensionLock,
-    LockedExtension, LockedSource, PackageStore, RootMetadata, RoutedCommand, SessionQueues,
-    SignatureEntry, SignedEnvelope, SupervisorPolicy, SupervisorState, discover_prompt_commands_in,
-    root_fingerprint, validate_package, verify_initial_root,
+    ActionError, ActionOutcome, CommandRouter, ExtensionLock, LockedExtension, LockedSource,
+    PackageStore, RootMetadata, RoutedCommand, SessionQueues, SignatureEntry, SignedEnvelope,
+    SupervisorPolicy, SupervisorState, discover_prompt_commands_in, root_fingerprint,
+    validate_package, verify_initial_root,
 };
 
 #[test]
@@ -55,15 +55,6 @@ fn command_symlink_escape_is_rejected() {
     fs::write(&outside, "secret").unwrap();
     std::os::unix::fs::symlink(&outside, commands.join("escape.md")).unwrap();
     assert!(discover_prompt_commands_in(None, &commands).is_err());
-}
-
-#[test]
-fn project_enablement_can_explicitly_disable_user_enablement() {
-    let mut user = ExtensionConfig::default();
-    user.set("example.test.tool", Enablement::Enabled);
-    let mut project = ExtensionConfig::default();
-    project.set("example.test.tool", Enablement::Disabled);
-    assert!(!ExtensionConfig::resolve("example.test.tool", &user, &project).enabled);
 }
 
 #[test]
@@ -135,6 +126,40 @@ fn supervisor_rejects_stale_and_undeclared_actions_and_coalesces_status() {
         value: ExtensionAction::CancelTimer(tokio_agent_extension_api::TimerId::new("x")),
     });
     assert_eq!(stale.unwrap_err(), ActionError::Stale);
+}
+
+#[test]
+fn extension_can_clear_its_status_segment() {
+    let mut supervisor = SupervisorState::new(SupervisorPolicy::default());
+    let id = ExtensionId::new("example.test.service");
+    let generation = supervisor.enable(id.clone(), [Capability::StatusWrite]);
+    supervisor
+        .apply(Sequenced {
+            sequence: 1,
+            extension: id.clone(),
+            generation,
+            value: ExtensionAction::SetStatusSegment(StatusSegment {
+                id: "task".into(),
+                text: "active".into(),
+                tone: StatusTone::Normal,
+                side: StatusSide::Left,
+                priority: 10,
+                min_width: 4,
+            }),
+        })
+        .unwrap();
+
+    let outcome = supervisor
+        .apply(Sequenced {
+            sequence: 2,
+            extension: id,
+            generation,
+            value: ExtensionAction::ClearStatusSegment("task".into()),
+        })
+        .unwrap();
+
+    assert_eq!(outcome, ActionOutcome::StatusCleared("task".into()));
+    assert!(supervisor.status_segments().is_empty());
 }
 
 #[test]

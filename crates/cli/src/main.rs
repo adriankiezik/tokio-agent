@@ -66,12 +66,18 @@ enum ExtensionCommand {
     Check {
         path: PathBuf,
     },
+    Build {
+        path: PathBuf,
+    },
     New {
         name: String,
     },
     Link(ScopeArgs),
-    Enable(IdScopeArgs),
-    Disable(IdScopeArgs),
+    Unlink {
+        id: String,
+        #[arg(long)]
+        project: bool,
+    },
     Alias(AliasArgs),
     Import(ImportArgs),
     Dev {
@@ -108,6 +114,11 @@ struct ScopeArgs {
     project: bool,
     #[arg(long)]
     approve: bool,
+    #[arg(
+        long,
+        help = "Allow a linked local package to override an installed official tokio.* extension"
+    )]
+    dev_override: bool,
 }
 
 #[derive(Debug, Args)]
@@ -123,13 +134,6 @@ struct AliasArgs {
     id: String,
     command: String,
     alias: String,
-    #[arg(long)]
-    project: bool,
-}
-
-#[derive(Debug, Args)]
-struct IdScopeArgs {
-    id: String,
     #[arg(long)]
     project: bool,
 }
@@ -155,37 +159,33 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_extension(command: ExtensionCommand) -> anyhow::Result<()> {
-    use tokio_agent_plugin::{Enablement, ExtensionConfig};
+    use tokio_agent_plugin::ExtensionConfig;
     let cwd = headless::cwd();
     match command {
         ExtensionCommand::List => {
             let user = ExtensionConfig::load(&extension_config_path(false, &cwd))?;
             let project = ExtensionConfig::load(&extension_config_path(true, &cwd))?;
-            let ids: std::collections::BTreeSet<_> = user
-                .extensions
+            let mut ids: std::collections::BTreeSet<String> = user
+                .linked
                 .keys()
-                .chain(project.extensions.keys())
-                .chain(user.linked.keys())
                 .chain(project.linked.keys())
+                .cloned()
                 .collect();
+            let store =
+                tokio_agent_plugin::PackageStore::user_default(semver::Version::new(1, 0, 0))?;
+            ids.extend(store.list()?.into_iter().map(|package| package.manifest.id));
             if ids.is_empty() {
                 println!("No extensions installed or linked.");
             }
             for id in ids {
-                let resolved = ExtensionConfig::resolve(id, &user, &project);
-                let scope = match resolved.source {
-                    Some(tokio_agent_plugin::ExtensionScope::Project) => "project",
-                    Some(tokio_agent_plugin::ExtensionScope::User) => "user",
-                    None => "default",
+                let scope = if project.linked.contains_key(&id) {
+                    "project link"
+                } else if user.linked.contains_key(&id) {
+                    "user link"
+                } else {
+                    "installed"
                 };
-                println!(
-                    "{id}\t{} ({scope})",
-                    if resolved.enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
+                println!("{id}\t{scope}");
             }
         }
         ExtensionCommand::Search { query } => {
@@ -253,6 +253,7 @@ fn run_extension(command: ExtensionCommand) -> anyhow::Result<()> {
                 tokio_agent_plugin::validate_package(&path, &semver::Version::new(1, 0, 0))?;
             println!("✓ {} {} is valid", manifest.id, manifest.version);
         }
+        ExtensionCommand::Build { path } => build_extension_component(&path)?,
         ExtensionCommand::New { name } => {
             create_extension(&cwd.join(&name), &name)?;
             println!("Created {name}/");
@@ -260,8 +261,10 @@ fn run_extension(command: ExtensionCommand) -> anyhow::Result<()> {
         ExtensionCommand::Link(args) => {
             let manifest =
                 tokio_agent_plugin::validate_package(&args.path, &semver::Version::new(1, 0, 0))?;
-            if manifest.id.starts_with("tokio.") {
-                anyhow::bail!("the `tokio.*` namespace is reserved for official registry packages");
+            if manifest.id.starts_with("tokio.") && !args.dev_override {
+                anyhow::bail!(
+                    "the `tokio.*` namespace is reserved; use --dev-override to explicitly run this local package instead of the installed registry version"
+                );
             }
             let capabilities = manifest.capabilities.as_set();
             if !capabilities.is_empty() && !args.approve {
@@ -275,7 +278,6 @@ fn run_extension(command: ExtensionCommand) -> anyhow::Result<()> {
             let config_path = extension_config_path(args.project, &cwd);
             let mut config = ExtensionConfig::load(&config_path)?;
             config.linked.insert(manifest.id.clone(), linked.clone());
-            config.set(manifest.id.clone(), Enablement::Enabled);
             if args.approve || capabilities.is_empty() {
                 config.approve_capabilities(tokio_agent_plugin::CapabilityGrant {
                     registry_identity: "local".to_owned(),
@@ -303,7 +305,7 @@ fn run_extension(command: ExtensionCommand) -> anyhow::Result<()> {
                 lock.save(&lock_path)?;
             }
             println!(
-                "Linked and enabled {} for {}.",
+                "Linked {} for {}.",
                 manifest.id,
                 if args.project {
                     "this project"
@@ -312,11 +314,26 @@ fn run_extension(command: ExtensionCommand) -> anyhow::Result<()> {
                 }
             );
         }
-        ExtensionCommand::Enable(args) => {
-            set_extension_enablement(&cwd, args, Enablement::Enabled)?
-        }
-        ExtensionCommand::Disable(args) => {
-            set_extension_enablement(&cwd, args, Enablement::Disabled)?
+        ExtensionCommand::Unlink { id, project } => {
+            let config_path = extension_config_path(project, &cwd);
+            let mut config = ExtensionConfig::load(&config_path)?;
+            if config.linked.remove(&id).is_none() {
+                anyhow::bail!("extension `{id}` is not linked in this scope");
+            }
+            config.save(&config_path)?;
+            if project {
+                let lock_path = cwd.join(".tokio-agent/extensions.lock");
+                let mut lock = tokio_agent_plugin::ExtensionLock::load(&lock_path)?;
+                lock.extensions.retain(|entry| {
+                    entry.id != id
+                        || !matches!(
+                            &entry.source,
+                            tokio_agent_plugin::LockedSource::Local { .. }
+                        )
+                });
+                lock.save(&lock_path)?;
+            }
+            println!("Unlinked {id}.");
         }
         ExtensionCommand::Alias(args) => set_command_alias(&cwd, args)?,
         ExtensionCommand::Import(args) => import_ecosystem_commands(&cwd, args)?,
@@ -622,7 +639,7 @@ fn install_registry_extension(args: InstallArgs) -> anyhow::Result<()> {
         user_config.save(&config_path)?;
     }
     println!(
-        "Installed {} {} from {identity}. It is not enabled.",
+        "Installed {} {} from {identity}.",
         installed.manifest.id, installed.manifest.version
     );
     Ok(())
@@ -753,23 +770,27 @@ fn remove_installed_extension(id: &str) -> anyhow::Result<()> {
             removed |= store.remove(id, &package.manifest.version)?;
         }
     }
+    let cwd = headless::cwd();
+    let mut configs = Vec::new();
+    for project in [false, true] {
+        let path = extension_config_path(project, &cwd);
+        let mut config = tokio_agent_plugin::ExtensionConfig::load(&path)?;
+        removed |= config.linked.remove(id).is_some();
+        config
+            .capability_grants
+            .retain(|grant| grant.extension_id != id);
+        configs.push((path, config));
+    }
+    if !removed {
+        anyhow::bail!("extension `{id}` is not installed or linked");
+    }
+    for (path, config) in configs {
+        config.save(&path)?;
+    }
     let records_path = store.root().join("installations.lock");
     let mut records = tokio_agent_plugin::ExtensionLock::load(&records_path)?;
     records.extensions.retain(|entry| entry.id != id);
     records.save(&records_path)?;
-    if !removed {
-        anyhow::bail!("extension `{id}` is not installed");
-    }
-    let cwd = headless::cwd();
-    for project in [false, true] {
-        let path = extension_config_path(project, &cwd);
-        let mut config = tokio_agent_plugin::ExtensionConfig::load(&path)?;
-        config.extensions.remove(id);
-        config
-            .capability_grants
-            .retain(|grant| grant.extension_id != id);
-        config.save(&path)?;
-    }
     let project_lock_path = cwd.join(".tokio-agent/extensions.lock");
     let mut project_lock = tokio_agent_plugin::ExtensionLock::load(&project_lock_path)?;
     project_lock.extensions.retain(|entry| entry.id != id);
@@ -886,75 +907,6 @@ fn set_command_alias(cwd: &Path, args: AliasArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn set_extension_enablement(
-    cwd: &Path,
-    args: IdScopeArgs,
-    value: tokio_agent_plugin::Enablement,
-) -> anyhow::Result<()> {
-    let config_path = extension_config_path(args.project, cwd);
-    let mut config = tokio_agent_plugin::ExtensionConfig::load(&config_path)?;
-    config.set(&args.id, value);
-    if args.project {
-        let project_lock_path = cwd.join(".tokio-agent/extensions.lock");
-        let mut project_lock = tokio_agent_plugin::ExtensionLock::load(&project_lock_path)?;
-        if value == tokio_agent_plugin::Enablement::Disabled {
-            project_lock.extensions.retain(|entry| entry.id != args.id);
-        } else {
-            let store =
-                tokio_agent_plugin::PackageStore::user_default(semver::Version::new(1, 0, 0))?;
-            let records =
-                tokio_agent_plugin::ExtensionLock::load(&store.root().join("installations.lock"))?;
-            if let Some(record) = records
-                .extensions
-                .into_iter()
-                .find(|entry| entry.id == args.id)
-            {
-                let registry_identity = match &record.source {
-                    tokio_agent_plugin::LockedSource::Registry { root_identity, .. } => {
-                        root_identity
-                    }
-                    tokio_agent_plugin::LockedSource::Local { .. } => {
-                        unreachable!("installation records contain registry packages")
-                    }
-                };
-                let grant = tokio_agent_plugin::CapabilityGrant {
-                    registry_identity: registry_identity.clone(),
-                    extension_id: record.id.clone(),
-                    publisher: record.publisher.clone().unwrap_or_default(),
-                    capabilities: record.capabilities.clone(),
-                };
-                let user =
-                    tokio_agent_plugin::ExtensionConfig::load(&extension_config_path(false, cwd))?;
-                if !user.grant_matches(&grant) && !config.grant_matches(&grant) {
-                    anyhow::bail!(
-                        "capabilities or publisher changed; reinstall with explicit approval before enabling"
-                    );
-                }
-                project_lock.upsert(record);
-            } else if !config.linked.contains_key(&args.id) {
-                anyhow::bail!("extension `{}` is not installed or linked", args.id);
-            }
-        }
-        project_lock.save(&project_lock_path)?;
-    }
-    config.save(&config_path)?;
-    println!(
-        "{} {} for {}.",
-        if value == tokio_agent_plugin::Enablement::Enabled {
-            "Enabled"
-        } else {
-            "Disabled"
-        },
-        args.id,
-        if args.project {
-            "this project"
-        } else {
-            "all projects"
-        }
-    );
-    Ok(())
-}
-
 fn extension_config_path(project: bool, cwd: &Path) -> PathBuf {
     if project {
         cwd.join(".tokio-agent/extensions.toml")
@@ -963,6 +915,99 @@ fn extension_config_path(project: bool, cwd: &Path) -> PathBuf {
             .unwrap_or_else(|| cwd.to_path_buf())
             .join("tokio-agent/extensions.toml")
     }
+}
+
+fn build_extension_component(path: &Path) -> anyhow::Result<()> {
+    let root = std::fs::canonicalize(path).context("resolving extension path")?;
+    let manifest_path = root.join("Cargo.toml");
+    if !manifest_path.is_file() {
+        anyhow::bail!("{} does not contain Cargo.toml", root.display());
+    }
+
+    let metadata = std::process::Command::new("cargo")
+        .args([
+            "metadata",
+            "--format-version=1",
+            "--no-deps",
+            "--manifest-path",
+        ])
+        .arg(&manifest_path)
+        .output()
+        .context("running cargo metadata")?;
+    if !metadata.status.success() {
+        anyhow::bail!(
+            "cargo metadata failed:\n{}",
+            String::from_utf8_lossy(&metadata.stderr).trim()
+        );
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&metadata.stdout).context("reading cargo metadata")?;
+    let target_directory = metadata
+        .get("target_directory")
+        .and_then(serde_json::Value::as_str)
+        .context("cargo metadata did not report a target directory")?;
+    let package = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|packages| packages.first())
+        .context("cargo metadata did not report the extension package")?;
+    let target_name = package
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|targets| {
+            targets.iter().find(|target| {
+                target
+                    .get("kind")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("cdylib")))
+            })
+        })
+        .and_then(|target| target.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .context("extension Cargo.toml must define a cdylib target")?
+        .replace('-', "_");
+
+    let status = std::process::Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--manifest-path",
+        ])
+        .arg(&manifest_path)
+        .status()
+        .context("running cargo build")?;
+    if !status.success() {
+        anyhow::bail!(
+            "extension build failed; install the target with `rustup target add wasm32-unknown-unknown`"
+        );
+    }
+
+    let core_wasm = PathBuf::from(target_directory)
+        .join("wasm32-unknown-unknown/release")
+        .join(format!("{target_name}.wasm"));
+    let component = root.join("component/extension.wasm");
+    std::fs::create_dir_all(component.parent().expect("component has parent"))?;
+    let status = std::process::Command::new("wasm-tools")
+        .args(["component", "new"])
+        .arg(&core_wasm)
+        .arg("-o")
+        .arg(&component)
+        .status()
+        .context("running wasm-tools; install it with `cargo install wasm-tools --locked`")?;
+    if !status.success() {
+        anyhow::bail!("wasm-tools failed to create the extension component");
+    }
+
+    let manifest = tokio_agent_plugin::validate_package(&root, &semver::Version::new(1, 0, 0))?;
+    println!(
+        "Built {} {} at {}",
+        manifest.id,
+        manifest.version,
+        component.display()
+    );
+    Ok(())
 }
 
 fn create_extension(path: &Path, name: &str) -> anyhow::Result<()> {
@@ -1060,6 +1105,7 @@ fn run_headless(prompt: String, yolo: bool) -> anyhow::Result<()> {
 }
 
 fn run_tui(yolo: bool) -> anyhow::Result<()> {
+    let mut tui = tokio_agent_tui::Tui::new().context("starting the terminal UI")?;
     std::thread::spawn(|| {
         if let Err(error) = load_registry_catalog(true) {
             tracing::debug!(%error, "background registry refresh failed");
@@ -1070,14 +1116,16 @@ fn run_tui(yolo: bool) -> anyhow::Result<()> {
         match session::build_session(&cwd, yolo) {
             Ok(agent) => break agent,
             Err(error) => {
-                if tokio_agent_tui::configure_provider(&cwd).context("configuring a provider")? {
+                if tui
+                    .configure_provider(&cwd)
+                    .context("configuring a provider")?
+                {
                     continue;
                 }
                 return Err(error);
             }
         }
     };
-    let mut tui = tokio_agent_tui::Tui::new().context("starting the terminal UI")?;
     loop {
         match tui.run(agent).context("running the terminal UI")? {
             tokio_agent_tui::RunOutcome::Quit => return Ok(()),
