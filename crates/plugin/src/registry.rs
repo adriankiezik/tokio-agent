@@ -11,13 +11,11 @@ use crate::{RootMetadata, SignedEnvelope, TufError, verify_initial_root, verify_
 
 pub const OFFICIAL_REGISTRY_URL: &str = "https://adriankiezik.github.io/tokio-agent";
 
-/// Returns the official root embedded by release builds after the production
-/// root ceremony. Development builds intentionally have no implicit official
-/// trust unless `TOKIO_AGENT_OFFICIAL_ROOT_JSON` was provided at compile time.
+/// Returns the official root established by the production root ceremony.
+/// Release builds may override the checked-in trust anchor during a root rotation.
 pub fn builtin_official_root() -> Result<Option<SignedEnvelope<RootMetadata>>, RegistryError> {
-    let Some(json) = option_env!("TOKIO_AGENT_OFFICIAL_ROOT_JSON") else {
-        return Ok(None);
-    };
+    let json = option_env!("TOKIO_AGENT_OFFICIAL_ROOT_JSON")
+        .unwrap_or(include_str!("../official-root.json"));
     let root: SignedEnvelope<RootMetadata> = serde_json::from_str(json)?;
     let fingerprint = crate::root_fingerprint(&root.signed);
     verify_initial_root(&root, &fingerprint, SystemTime::now())?;

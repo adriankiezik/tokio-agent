@@ -1,0 +1,22 @@
+{
+  "signed": {
+    "version": 1,
+    "expires_unix": 2099224116,
+    "registry_name": "tokio-agent official registry",
+    "operator": "tokio-agent project",
+    "keys": {
+      "sha256:2650cd2a51876798db1f1803463e8f3e1b029351775231a9b280d0bb38a00c25": "f6IxvR8a82t5E16DLN9aXa1ivfXPt5RNETuqDXTS4AQ="
+    },
+    "threshold": 1,
+    "index_keys": {
+      "sha256:7e23dd953b388b7759a52d63cf40cc0d76f2f0138c6b622f34422bb1132f9ba6": "Oy+XOsCrIW6Iyr4H+xS+tHgx0j6bv4y//7mQsge2n1Y="
+    },
+    "index_threshold": 1
+  },
+  "signatures": [
+    {
+      "key_id": "sha256:2650cd2a51876798db1f1803463e8f3e1b029351775231a9b280d0bb38a00c25",
+      "signature": "fIV73SOHbtsFXiHp49VccSWwr8U9tyueCZnAO2ZYUJkfzAasd0sz/LaWGM+pBjY3MEbW9XIL4xtAvprM1fmeDA=="
+    }
+  ]
+}
