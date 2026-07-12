@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 tokio-agent-core.workspace = true
+tokio-agent-extension-api.workspace = true
 tokio-agent-config.workspace = true
 tokio-agent-auth.workspace = true
 tokio-util.workspace = true
@@ -25,6 +26,7 @@ tokio.workspace = true
 tracing.workspace = true
 base64.workspace = true
 dirs.workspace = true
+semver.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

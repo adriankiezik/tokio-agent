@@ -1,0 +1,73 @@
+name: Publish official extension registry
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-registry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Build official components from reviewed source
+        run: |
+          cargo install wasm-tools --locked
+          cargo build --release --target wasm32-unknown-unknown --manifest-path registry/extensions/loop/Cargo.toml
+          cargo build --release --target wasm32-unknown-unknown --manifest-path registry/extensions/goal/Cargo.toml
+          mkdir -p registry/extensions/loop/component registry/extensions/goal/component
+          wasm-tools component new registry/extensions/loop/target/wasm32-unknown-unknown/release/tokio_agent_official_loop.wasm -o registry/extensions/loop/component/extension.wasm
+          wasm-tools component new registry/extensions/goal/target/wasm32-unknown-unknown/release/tokio_agent_official_goal.wasm -o registry/extensions/goal/component/extension.wasm
+      - name: Validate host and registry tooling
+        run: |
+          cargo check --workspace
+          cargo test -p tokio-agent-plugin --test extension_system
+          cargo test -p tokio-agent-extension-host --test isolation
+      - name: Generate signed immutable registry
+        env:
+          REGISTRY_INDEX_SIGNING_KEY: ${{ secrets.REGISTRY_INDEX_SIGNING_KEY }}
+          REGISTRY_ROOT_JSON: ${{ vars.REGISTRY_ROOT_JSON }}
+        run: |
+          test -n "$REGISTRY_INDEX_SIGNING_KEY"
+          test -n "$REGISTRY_ROOT_JSON"
+          umask 077
+          printf '%s' "$REGISTRY_INDEX_SIGNING_KEY" > "$RUNNER_TEMP/registry.key"
+          printf '%s' "$REGISTRY_ROOT_JSON" > "$RUNNER_TEMP/root.json"
+          cargo run -p tokio-agent-registry-tool -- generate \
+            --source registry/extensions \
+            --output registry/site \
+            --signing-key "$RUNNER_TEMP/registry.key" \
+            --root "$RUNNER_TEMP/root.json" \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}" \
+            --name "tokio-agent official registry" \
+            --operator "tokio-agent project"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: registry/site
+      - name: Publish immutable package assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "Official extension packages"
+          gh release upload "$GITHUB_REF_NAME" registry/site/packages/*
+        if: startsWith(github.ref, 'refs/tags/')
+
+  deploy-pages:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-registry
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy signed metadata
+        id: deployment
+        uses: actions/deploy-pages@v4

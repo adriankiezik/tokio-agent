@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 tokio-agent-config.workspace = true
+tokio-agent-extension-api.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true

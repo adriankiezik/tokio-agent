@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -12,22 +12,128 @@ use crate::context::PendingToolCall;
 use crate::permission::{Outcome, PermissionEngine};
 use crate::tool::{Tool, ToolCtx, ToolDef, ToolResult};
 
+#[derive(Clone, Default)]
+pub struct DynamicToolCatalog {
+    tools: Arc<RwLock<BTreeMap<String, DynamicTool>>>,
+    reserved: Arc<BTreeSet<String>>,
+}
+
+#[derive(Clone)]
+struct DynamicTool {
+    owner: String,
+    tool: Arc<dyn Tool>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum DynamicToolError {
+    #[error("tool name `{0}` is already registered")]
+    Collision(String),
+}
+
+impl DynamicToolCatalog {
+    pub fn register(
+        &self,
+        owner: impl Into<String>,
+        tool: Arc<dyn Tool>,
+    ) -> Result<(), DynamicToolError> {
+        let name = tool.schema().name;
+        let mut tools = self
+            .tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.reserved.contains(&name) || tools.contains_key(&name) {
+            return Err(DynamicToolError::Collision(name));
+        }
+        tools.insert(
+            name,
+            DynamicTool {
+                owner: owner.into(),
+                tool,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn unregister(&self, owner: &str, name: &str) -> bool {
+        let mut tools = self
+            .tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tools.get(name).is_some_and(|tool| tool.owner == owner) {
+            tools.remove(name);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn disable(&self, owner: &str) {
+        self.tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, tool| tool.owner != owner);
+    }
+
+    fn snapshot(&self) -> BTreeMap<String, Arc<dyn Tool>> {
+        self.tools
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(name, tool)| (name.clone(), tool.tool.clone()))
+            .collect()
+    }
+}
+
 pub(crate) struct ToolCallExecutor {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    dynamic: DynamicToolCatalog,
+    lifecycle: Option<Arc<dyn Fn(String, bool) + Send + Sync>>,
     cwd: PathBuf,
 }
 
 impl ToolCallExecutor {
     pub(crate) fn new(tools: Vec<Arc<dyn Tool>>, cwd: PathBuf) -> Self {
-        let tools = tools
+        let tools: BTreeMap<_, _> = tools
             .into_iter()
             .map(|tool| (tool.schema().name, tool))
             .collect();
-        Self { tools, cwd }
+        let dynamic = DynamicToolCatalog {
+            reserved: Arc::new(tools.keys().cloned().collect()),
+            ..DynamicToolCatalog::default()
+        };
+        Self {
+            tools,
+            dynamic,
+            lifecycle: None,
+            cwd,
+        }
+    }
+
+    pub(crate) fn with_lifecycle_callback(
+        mut self,
+        callback: Arc<dyn Fn(String, bool) + Send + Sync>,
+    ) -> Self {
+        self.lifecycle = Some(callback);
+        self
+    }
+
+    pub(crate) fn dynamic_catalog(&self) -> DynamicToolCatalog {
+        self.dynamic.clone()
     }
 
     pub(crate) fn schemas(&self) -> Vec<ToolDef> {
-        self.tools.values().map(|tool| tool.schema()).collect()
+        let mut schemas: BTreeMap<_, _> = self
+            .tools
+            .iter()
+            .map(|(name, tool)| (name.clone(), tool.schema()))
+            .collect();
+        schemas.extend(
+            self.dynamic
+                .snapshot()
+                .into_iter()
+                .map(|(name, tool)| (name, tool.schema())),
+        );
+        schemas.into_values().collect()
     }
 
     pub(crate) async fn execute(
@@ -52,6 +158,9 @@ impl ToolCallExecutor {
                         name: call.name.clone(),
                         result: result.clone(),
                     });
+                    if let Some(lifecycle) = &self.lifecycle {
+                        lifecycle(call.name.clone(), result.is_error);
+                    }
                     results[index] = Some(result);
                 }
                 PreparedTool::Run { tool, args } => {
@@ -80,9 +189,12 @@ impl ToolCallExecutor {
         while let Some((index, id, name, result)) = running.next().await {
             let _ = events.send(AgentEvent::ToolFinished {
                 id,
-                name,
+                name: name.clone(),
                 result: result.clone(),
             });
+            if let Some(lifecycle) = &self.lifecycle {
+                lifecycle(name, result.is_error);
+            }
             results[index] = Some(result);
         }
 
@@ -105,7 +217,12 @@ impl ToolCallExecutor {
             summary: tool_call_summary(&call.name, &call.raw_args),
         });
 
-        let Some(tool) = self.tools.get(&call.name).cloned() else {
+        let tool = self
+            .tools
+            .get(&call.name)
+            .cloned()
+            .or_else(|| self.dynamic.snapshot().remove(&call.name));
+        let Some(tool) = tool else {
             return PreparedTool::Immediate(ToolResult::error(format!(
                 "unknown tool: {}",
                 call.name

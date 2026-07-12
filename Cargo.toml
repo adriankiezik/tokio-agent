@@ -1,8 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/extension-api",
+    "crates/extension-host",
     "crates/core",
     "crates/provider",
+    "crates/registry-tool",
     "crates/tools",
     "crates/tui",
     "crates/config",
@@ -20,6 +23,8 @@ license = "MIT"
 repository = "https://github.com/adriankiezik/tokio-agent"
 
 [workspace.dependencies]
+tokio-agent-extension-api = { path = "crates/extension-api" }
+tokio-agent-extension-host = { path = "crates/extension-host" }
 tokio-agent-core = { path = "crates/core" }
 tokio-agent-provider = { path = "crates/provider" }
 tokio-agent-tools = { path = "crates/tools" }
@@ -28,11 +33,12 @@ tokio-agent-config = { path = "crates/config" }
 tokio-agent-auth = { path = "crates/auth" }
 tokio-agent-mcp = { path = "crates/mcp" }
 tokio-agent-plugin = { path = "crates/plugin" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "io-std", "time", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+serde_yaml = "0.9"
 toml = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 ratatui = "0.30"
@@ -60,6 +66,12 @@ rand = "0.9"
 urlencoding = "2"
 nix = { version = "0.30", features = ["signal"] }
 insta = "1"
+semver = { version = "1", features = ["serde"] }
+walkdir = "2"
+ed25519-dalek = "2"
+wasmtime = { version = "38", default-features = false, features = ["async", "component-model", "cranelift", "runtime"] }
+tar = "0.4"
+flate2 = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

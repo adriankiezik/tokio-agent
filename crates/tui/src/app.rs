@@ -18,8 +18,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_agent_core::agent::{Agent, AgentEvent, AgentState, UiCommand};
 use tokio_agent_core::permission::Mode;
 use tokio_agent_core::provider::Provider;
+use tokio_agent_extension_api::{CommandDescriptor, ExtensionSummary};
 
-use crate::projection::{FrontendEffect, FrontendProjection};
+use crate::projection::{ExtensionOperation, FrontendEffect, FrontendProjection};
 use crate::provider_setup::{configure_provider_in, configure_provider_with_terminal};
 use crate::theme;
 
@@ -27,6 +28,7 @@ use crate::theme;
 pub enum RunOutcome {
     Quit,
     ConfigureProvider,
+    ExtensionsChanged,
 }
 
 pub struct Tui {
@@ -101,6 +103,8 @@ fn run_session<P: Provider + 'static>(
         context_window: agent.context_before_compaction(),
         max_output_tokens: agent.max_output_tokens(),
         permission_mode: agent.permission_mode(),
+        commands: agent.command_catalog(),
+        extensions: agent.extension_catalog(),
         history: tokio_agent_config::recent_messages().unwrap_or_else(|error| {
             tracing::warn!(%error, "failed to load recent message history");
             Vec::new()
@@ -122,6 +126,8 @@ fn run_session<P: Provider + 'static>(
             session.context_window,
             session.max_output_tokens,
             session.permission_mode,
+            session.commands.clone(),
+            session.extensions.clone(),
         );
     }
     let mut agent_task = handle.spawn(agent.run(commands_rx, events_tx));
@@ -169,6 +175,32 @@ fn run_session<P: Provider + 'static>(
     }
 }
 
+fn run_extension_operation(operation: ExtensionOperation) -> io::Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command.arg("extension");
+    match operation {
+        ExtensionOperation::Install { id, registry } => {
+            command.args(["install", &id, "--registry", &registry, "--approve"]);
+        }
+        ExtensionOperation::SetEnabled { id, enabled } => {
+            command.args([if enabled { "enable" } else { "disable" }, &id, "--project"]);
+        }
+    }
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "extension command exited with {status}"
+        )))
+    }
+}
+
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
@@ -203,6 +235,7 @@ struct App {
     visible_text: Vec<Vec<String>>,
     provider_restart_pending: bool,
     provider_restart_ready: bool,
+    extension_operation: Option<std::sync::mpsc::Receiver<io::Result<()>>>,
 }
 
 struct SessionDisplay {
@@ -214,6 +247,8 @@ struct SessionDisplay {
     max_output_tokens: u32,
     permission_mode: Mode,
     history: Vec<String>,
+    commands: Vec<CommandDescriptor>,
+    extensions: Vec<ExtensionSummary>,
 }
 
 impl Default for SessionDisplay {
@@ -227,6 +262,8 @@ impl Default for SessionDisplay {
             max_output_tokens: 0,
             permission_mode: Mode::Suggest,
             history: Vec::new(),
+            commands: Vec::new(),
+            extensions: Vec::new(),
         }
     }
 }
@@ -266,6 +303,8 @@ impl App {
                 session.max_output_tokens,
                 session.permission_mode,
                 session.history,
+                session.commands,
+                session.extensions,
             ),
             commands_tx,
             events_rx,
@@ -277,6 +316,7 @@ impl App {
             visible_text: Vec::new(),
             provider_restart_pending: false,
             provider_restart_ready: false,
+            extension_operation: None,
         }
     }
 
@@ -291,6 +331,8 @@ impl App {
                 None,
                 0,
                 Mode::Suggest,
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
             ),
         )
@@ -328,6 +370,23 @@ impl App {
     }
 
     fn drain_events(&mut self) {
+        if let Some(operation) = &self.extension_operation {
+            match operation.try_recv() {
+                Ok(Ok(())) => {
+                    self.extension_operation = None;
+                    self.outcome = RunOutcome::ExtensionsChanged;
+                    self.quit = true;
+                }
+                Ok(Err(error)) => {
+                    self.extension_operation = None;
+                    tracing::warn!(%error, "extension operation failed");
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.extension_operation = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         while let Ok(event) = self.events_rx.try_recv() {
             let turn_done = matches!(&event, AgentEvent::TurnDone(_));
             self.projection.apply(event);
@@ -379,6 +438,15 @@ impl App {
             FrontendEffect::Copy(text) => {
                 let _ = copy_text(&text);
             }
+            FrontendEffect::Extension(operation) => {
+                if self.extension_operation.is_none() {
+                    let (send, receive) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = send.send(run_extension_operation(operation));
+                    });
+                    self.extension_operation = Some(receive);
+                }
+            }
             FrontendEffect::Command(command) => {
                 match &command {
                     UiCommand::SetPermissionMode(mode) => {
@@ -402,14 +470,21 @@ impl App {
                         }
                     }
                     UiCommand::SetReasoningEffort(None) => {}
-                    UiCommand::UserMessage(message) | UiCommand::Steer(message) => {
+                    UiCommand::UserMessage(message)
+                    | UiCommand::AutomaticMessage { text: message, .. }
+                    | UiCommand::Steer(message) => {
                         if let Err(error) = tokio_agent_config::store_recent_message(message) {
                             tracing::warn!(%error, "failed to persist recent message");
                         }
                     }
                     _ => {}
                 }
-                let submission = matches!(command, UiCommand::UserMessage(_) | UiCommand::Steer(_));
+                let submission = matches!(
+                    command,
+                    UiCommand::UserMessage(_)
+                        | UiCommand::AutomaticMessage { .. }
+                        | UiCommand::Steer(_)
+                );
                 if self.commands_tx.send(command).is_err() && submission {
                     self.projection.submission_failed();
                 }
@@ -519,6 +594,8 @@ impl App {
             .render_command_feedback(frame, command_feedback_area);
         self.projection.render_interaction(frame, interaction_area);
         self.projection.render_footer(frame, footer_area);
+        self.projection
+            .render_extension_manager(frame, frame.area());
         self.selection_area = frame.area();
         self.visible_text = snapshot_and_highlight(frame, self.selection_area, self.selection);
         provider_area

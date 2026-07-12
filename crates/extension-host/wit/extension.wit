@@ -1,0 +1,17 @@
+package tokio:agent@1.0.0;
+
+world extension {
+    /// Handles a manifest-declared command. The returned JSON must decode to
+    /// `list<ExtensionAction>` from tokio-agent-extension-api.
+    export on-command: func(handler: string, arguments: string) -> string;
+
+    /// Receives one sanitized sequenced session event and returns JSON actions.
+    export on-event: func(event-json: string) -> string;
+
+    /// Executes one model-callable tool. The result is JSON containing
+    /// `content: string` and `is_error: bool`.
+    export on-tool: func(handler: string, arguments-json: string) -> string;
+
+    /// Restores the last host-validated opaque session state after a companion restart.
+    export restore-session-state: func(state: list<u8>);
+}

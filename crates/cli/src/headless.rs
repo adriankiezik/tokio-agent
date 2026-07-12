@@ -84,7 +84,17 @@ impl Printer {
                     usage.cache_write_tokens
                 );
             }
-            AgentEvent::RequestUsage(_) => {}
+            AgentEvent::RequestUsage(_)
+            | AgentEvent::StatusSegments(_)
+            | AgentEvent::CommandCatalog(_)
+            | AgentEvent::ExtensionCatalog(_) => {}
+            AgentEvent::CommandHandled(result) => {
+                self.end_text();
+                return Some(match result {
+                    Ok(_) => Ok(tokio_agent_core::event::StopReason::EndTurn),
+                    Err(error) => Err(AgentError::Command(error)),
+                });
+            }
             AgentEvent::PermissionNeeded { id, request } => {
                 self.end_text();
                 eprintln!(

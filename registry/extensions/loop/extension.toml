@@ -1,0 +1,29 @@
+manifest_version = 1
+id = "tokio.official.loop"
+name = "Loop"
+version = "1.0.0"
+description = "Run a prompt repeatedly on a fixed-delay interval"
+license = "MIT"
+host_api = ">=1.0, <2.0"
+
+[runtime]
+component = "component/extension.wasm"
+
+[[commands]]
+name = "loop"
+description = "Run a prompt repeatedly on an interval"
+usage = "/loop <10s|5m|2h> <prompt> | cancel"
+handler = "loop_command"
+
+[[status]]
+id = "loop"
+side = "left"
+priority = 90
+handler = "loop_status"
+
+[capabilities]
+session_observe = true
+session_submit_automatic = true
+session_schedule = true
+status_write = true
+storage_session = true

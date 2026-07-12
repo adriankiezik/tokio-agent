@@ -1,14 +1,18 @@
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use tokio_agent_core::agent::{AgentEvent, UiCommand};
 use tokio_agent_core::message::{ToolOutput, Usage};
 use tokio_agent_core::permission::{Decision, Mode, PermissionId};
 use tokio_agent_core::tool::{Action, PermissionRequest};
+use tokio_agent_extension_api::{
+    CommandDescriptor, CommandId, CommandSource, ExtensionSummary, StatusSegment,
+};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -22,63 +26,38 @@ mod transcript;
 use composer::Composer;
 use transcript::Transcript;
 
+#[derive(Debug)]
+pub(crate) enum ExtensionOperation {
+    Install { id: String, registry: String },
+    SetEnabled { id: String, enabled: bool },
+}
+
 pub(crate) enum FrontendEffect {
     None,
     Quit,
     ConfigureProvider,
     Copy(String),
+    Extension(ExtensionOperation),
     Command(UiCommand),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SlashCommand {
-    name: &'static str,
-    description: &'static str,
+    name: Cow<'static, str>,
+    description: Cow<'static, str>,
+    usage: Option<Cow<'static, str>>,
     action: SlashAction,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SlashAction {
     Clear,
     Model,
-    Goal,
-    Loop,
     Permissions,
     Provider,
+    Extensions,
+    Extension(CommandId),
 }
-
-const SLASH_COMMANDS: [SlashCommand; 6] = [
-    SlashCommand {
-        name: "/clear",
-        description: "Clear the conversation and start fresh",
-        action: SlashAction::Clear,
-    },
-    SlashCommand {
-        name: "/model",
-        description: "Switch models for this session",
-        action: SlashAction::Model,
-    },
-    SlashCommand {
-        name: "/goal",
-        description: "Keep working autonomously until an objective is complete",
-        action: SlashAction::Goal,
-    },
-    SlashCommand {
-        name: "/loop",
-        description: "Run a prompt repeatedly on an interval",
-        action: SlashAction::Loop,
-    },
-    SlashCommand {
-        name: "/permissions",
-        description: "Select how the agent asks for permission",
-        action: SlashAction::Permissions,
-    },
-    SlashCommand {
-        name: "/providers",
-        description: "Connect or switch AI providers",
-        action: SlashAction::Provider,
-    },
-];
 
 #[derive(Clone, Copy)]
 struct PermissionModeOption {
@@ -111,6 +90,13 @@ const COMMAND_NOTICE_DURATION: Duration = Duration::from_secs(3);
 struct Pending {
     id: PermissionId,
     request: PermissionRequest,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtensionTab {
+    Discover,
+    Installed,
+    Updates,
 }
 
 #[derive(Clone, Copy)]
@@ -149,9 +135,17 @@ pub(crate) struct FrontendProjection {
     scroll_button_area: Option<Rect>,
     command_error: Option<String>,
     command_notice: Option<(String, Instant)>,
+    extension_commands: Vec<SlashCommand>,
+    status_segments: Vec<StatusSegment>,
+    extensions: Vec<ExtensionSummary>,
+    extension_manager: Option<usize>,
+    extension_tab: ExtensionTab,
+    extension_search: String,
+    extension_disable_confirmation: Option<String>,
 }
 
 impl FrontendProjection {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         provider: String,
         model: String,
@@ -161,6 +155,8 @@ impl FrontendProjection {
         max_output_tokens: u32,
         permission_mode: Mode,
         history: Vec<String>,
+        extension_commands: Vec<CommandDescriptor>,
+        extensions: Vec<ExtensionSummary>,
     ) -> Self {
         Self {
             transcript: Transcript::new(),
@@ -192,9 +188,20 @@ impl FrontendProjection {
             scroll_button_area: None,
             command_error: None,
             command_notice: None,
+            extension_commands: extension_commands
+                .into_iter()
+                .map(extension_slash_command)
+                .collect(),
+            status_segments: Vec::new(),
+            extensions,
+            extension_manager: None,
+            extension_tab: ExtensionTab::Installed,
+            extension_search: String::new(),
+            extension_disable_confirmation: None,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_session(
         &mut self,
         provider: String,
@@ -204,6 +211,8 @@ impl FrontendProjection {
         context_window: Option<u64>,
         max_output_tokens: u32,
         permission_mode: Mode,
+        commands: Vec<CommandDescriptor>,
+        extensions: Vec<ExtensionSummary>,
     ) {
         self.provider = provider;
         self.model = model;
@@ -212,6 +221,9 @@ impl FrontendProjection {
         self.context_window = context_window;
         self.max_output_tokens = max_output_tokens;
         self.permission_mode = permission_mode;
+        self.extension_commands = commands.into_iter().map(extension_slash_command).collect();
+        self.extensions = extensions;
+        self.extension_manager = None;
         self.pending = None;
         self.running = false;
         self.interrupting = false;
@@ -229,6 +241,105 @@ impl FrontendProjection {
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> FrontendEffect {
         self.command_error = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(id) = self.extension_disable_confirmation.clone() {
+            match key.code {
+                KeyCode::Esc => self.extension_disable_confirmation = None,
+                KeyCode::Enter | KeyCode::Char('e') => {
+                    self.extension_disable_confirmation = None;
+                    return FrontendEffect::Extension(ExtensionOperation::SetEnabled {
+                        id,
+                        enabled: false,
+                    });
+                }
+                _ => {}
+            }
+            return FrontendEffect::None;
+        }
+        if let Some(selected) = self.extension_manager {
+            let selected_extension = self.visible_extensions().get(selected).copied().cloned();
+            match key.code {
+                KeyCode::Esc => self.extension_manager = None,
+                KeyCode::Up => self.extension_manager = Some(selected.saturating_sub(1)),
+                KeyCode::Down => {
+                    self.extension_manager =
+                        Some((selected + 1).min(self.visible_extensions().len().saturating_sub(1)));
+                }
+                KeyCode::Left => {
+                    self.extension_tab = match self.extension_tab {
+                        ExtensionTab::Discover => ExtensionTab::Updates,
+                        ExtensionTab::Installed => ExtensionTab::Discover,
+                        ExtensionTab::Updates => ExtensionTab::Installed,
+                    };
+                    self.extension_manager = Some(0);
+                }
+                KeyCode::Right | KeyCode::Tab => {
+                    self.extension_tab = match self.extension_tab {
+                        ExtensionTab::Discover => ExtensionTab::Installed,
+                        ExtensionTab::Installed => ExtensionTab::Updates,
+                        ExtensionTab::Updates => ExtensionTab::Discover,
+                    };
+                    self.extension_manager = Some(0);
+                }
+                KeyCode::Backspace => {
+                    self.extension_search.pop();
+                    self.extension_manager = Some(0);
+                }
+                KeyCode::Char('i')
+                    if selected_extension
+                        .as_ref()
+                        .is_some_and(|extension| !extension.installed) =>
+                {
+                    if let Some(extension) = selected_extension {
+                        let registry = match extension.origin {
+                            tokio_agent_extension_api::ExtensionOrigin::OfficialRegistry {
+                                registry,
+                            }
+                            | tokio_agent_extension_api::ExtensionOrigin::ThirdPartyRegistry {
+                                registry,
+                                ..
+                            } => registry,
+                            tokio_agent_extension_api::ExtensionOrigin::Local { .. } => {
+                                return FrontendEffect::None;
+                            }
+                        };
+                        return FrontendEffect::Extension(ExtensionOperation::Install {
+                            id: extension.id.to_string(),
+                            registry,
+                        });
+                    }
+                }
+                KeyCode::Char('e')
+                    if selected_extension
+                        .as_ref()
+                        .is_some_and(|extension| extension.installed) =>
+                {
+                    if let Some(extension) = selected_extension {
+                        if extension.enabled
+                            && extension.capabilities.contains(
+                                &tokio_agent_extension_api::Capability::SessionSubmitAutomatic,
+                            )
+                        {
+                            self.extension_disable_confirmation = Some(extension.id.to_string());
+                            return FrontendEffect::None;
+                        }
+                        return FrontendEffect::Extension(ExtensionOperation::SetEnabled {
+                            id: extension.id.to_string(),
+                            enabled: !extension.enabled,
+                        });
+                    }
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    self.extension_search.push(character);
+                    self.extension_manager = Some(0);
+                }
+                _ => {}
+            }
+            return FrontendEffect::None;
+        }
         if self.provider_change_notice {
             if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
                 self.provider_change_notice = false;
@@ -407,7 +518,7 @@ impl FrontendProjection {
             }
             KeyCode::Tab => {
                 if let Some(command) = self.selected_slash_command() {
-                    self.composer.replace(command.name);
+                    self.composer.replace(&command.name);
                 }
                 Some(FrontendEffect::None)
             }
@@ -583,13 +694,13 @@ impl FrontendProjection {
 
     fn slash_matches(&self) -> Vec<SlashCommand> {
         let query = self.composer.text();
-        SLASH_COMMANDS
+        self.extension_commands
             .iter()
-            .copied()
             .filter(|command| command.name.starts_with(query))
             .filter(|command| {
                 !matches!(command.action, SlashAction::Model) || !self.model_options().is_empty()
             })
+            .cloned()
             .collect()
     }
 
@@ -603,13 +714,13 @@ impl FrontendProjection {
             return matches;
         }
 
-        SLASH_COMMANDS
+        self.extension_commands
             .iter()
-            .copied()
             .filter(|command| {
-                matches!(command.action, SlashAction::Goal | SlashAction::Loop)
-                    && command_usage_visible(command.name, self.composer.text())
+                command.usage.is_some()
+                    && command_usage_visible(&command.name, self.composer.text())
             })
+            .cloned()
             .collect()
     }
 
@@ -617,7 +728,7 @@ impl FrontendProjection {
         let matches = self.slash_matches();
         matches
             .get(self.slash_selected.min(matches.len().saturating_sub(1)))
-            .copied()
+            .cloned()
     }
 
     fn run_selected_slash_command(&mut self) -> FrontendEffect {
@@ -643,14 +754,6 @@ impl FrontendProjection {
                 self.setting_picker = Some(SettingPicker::Model(selected));
                 FrontendEffect::None
             }
-            SlashAction::Goal => {
-                self.composer.replace("/goal ");
-                FrontendEffect::None
-            }
-            SlashAction::Loop => {
-                self.composer.replace("/loop ");
-                FrontendEffect::None
-            }
             SlashAction::Permissions => {
                 self.permissions_selected = Some(
                     PERMISSION_MODES
@@ -665,6 +768,14 @@ impl FrontendProjection {
                 FrontendEffect::None
             }
             SlashAction::Provider => FrontendEffect::ConfigureProvider,
+            SlashAction::Extensions => {
+                self.extension_manager = Some(0);
+                FrontendEffect::None
+            }
+            SlashAction::Extension(_) => {
+                self.composer.replace(&format!("{} ", command.name));
+                FrontendEffect::None
+            }
         }
     }
 
@@ -676,39 +787,59 @@ impl FrontendProjection {
             return FrontendEffect::None;
         }
         let message = trimmed.to_owned();
-        match parse_autonomy_command(&message) {
-            AutonomyCommandParse::Valid(command) => {
-                self.command_notice = command_notice(&command)
-                    .map(|message| (message.to_owned(), Instant::now() + COMMAND_NOTICE_DURATION));
-                self.composer.clear();
-                self.transcript.push_user(message.clone());
-                self.scroll_up = 0;
-                if self.history.last() != Some(&message) {
-                    self.history.push(message);
+        if message.starts_with('/') {
+            let (name, arguments) = message
+                .split_once(char::is_whitespace)
+                .unwrap_or((&message, ""));
+            if let Some(command) = self
+                .extension_commands
+                .iter()
+                .find(|command| command.name == name)
+                .cloned()
+                && let SlashAction::Extension(id) = command.action
+            {
+                if self.running {
+                    self.command_error =
+                        Some(format!("{name} is unavailable while a turn is running"));
+                    return FrontendEffect::None;
                 }
-                self.leave_history();
-                FrontendEffect::Command(command)
-            }
-            AutonomyCommandParse::Invalid(error) => {
-                self.command_notice = None;
-                self.command_error = Some(error);
-                FrontendEffect::None
-            }
-            AutonomyCommandParse::NotACommand => {
                 self.composer.clear();
                 if self.history.last() != Some(&message) {
                     self.history.push(message.clone());
                 }
                 self.leave_history();
-                if self.running {
-                    self.transcript.push_user(message.clone());
-                    self.scroll_up = 0;
-                    FrontendEffect::Command(UiCommand::Steer(message))
-                } else {
-                    self.begin_turn(&message);
-                    FrontendEffect::Command(UiCommand::UserMessage(message))
-                }
+                self.begin_turn(&message);
+                return FrontendEffect::Command(UiCommand::InvokeCommand {
+                    id,
+                    arguments: arguments.trim().to_owned(),
+                });
             }
+            if let Some(extension) = self.extensions.iter().find(|extension| {
+                extension.installed
+                    && !extension.enabled
+                    && extension.commands.iter().any(|command| command == name)
+            }) {
+                self.command_error = Some(format!(
+                    "{name} is provided by “{}”, which is installed but disabled · open /extensions to enable it",
+                    extension.name
+                ));
+            } else {
+                self.command_error = Some(format!("Unknown command: {name}"));
+            }
+            return FrontendEffect::None;
+        }
+        self.composer.clear();
+        if self.history.last() != Some(&message) {
+            self.history.push(message.clone());
+        }
+        self.leave_history();
+        if self.running {
+            self.transcript.push_user(message.clone());
+            self.scroll_up = 0;
+            FrontendEffect::Command(UiCommand::Steer(message))
+        } else {
+            self.begin_turn(&message);
+            FrontendEffect::Command(UiCommand::UserMessage(message))
         }
     }
 
@@ -770,8 +901,8 @@ impl FrontendProjection {
             return;
         }
         frame.render_widget(Block::default().style(theme::picker_bg()), area);
-        let name_width = slash_command_name_width();
         let matches = self.slash_display_matches();
+        let name_width = slash_command_name_width(&matches);
         let query = self.composer.text();
         let lines = matches
             .into_iter()
@@ -796,8 +927,8 @@ impl FrontendProjection {
                     Span::raw("  "),
                     Span::styled(
                         slash_command_description(
-                            command,
-                            command_usage_visible(command.name, query),
+                            &command,
+                            command_usage_visible(&command.name, query),
                         ),
                         theme::picker_muted(),
                     ),
@@ -1004,6 +1135,33 @@ impl FrontendProjection {
                 self.pause_elapsed_timer();
                 self.pending = Some(Pending { id, request });
             }
+            AgentEvent::ExtensionCatalog(catalog) => {
+                self.extensions = catalog;
+                self.extension_manager = self.extension_manager.map(|selected| {
+                    selected.min(self.visible_extensions().len().saturating_sub(1))
+                });
+            }
+            AgentEvent::CommandCatalog(catalog) => {
+                self.extension_commands =
+                    catalog.into_iter().map(extension_slash_command).collect();
+                self.slash_selected = 0;
+            }
+            AgentEvent::StatusSegments(mut segments) => {
+                segments.sort_by_key(|segment| std::cmp::Reverse(segment.priority));
+                self.status_segments = segments;
+            }
+            AgentEvent::CommandHandled(result) => {
+                match result {
+                    Ok(notice) => {
+                        self.command_notice = notice
+                            .map(|message| (message, Instant::now() + COMMAND_NOTICE_DURATION));
+                    }
+                    Err(error) => self.command_error = Some(error),
+                }
+                self.pause_elapsed_timer();
+                self.running = false;
+                self.interrupting = false;
+            }
             AgentEvent::TurnDone(result) => {
                 if let Err(error) = result {
                     self.transcript.push_error(&format!("error: {error}"));
@@ -1130,6 +1288,145 @@ impl FrontendProjection {
             .render(frame, area, spinner, &mut self.scroll_up);
     }
 
+    fn visible_extensions(&self) -> Vec<&ExtensionSummary> {
+        let query = self.extension_search.to_ascii_lowercase();
+        self.extensions
+            .iter()
+            .filter(|extension| match self.extension_tab {
+                ExtensionTab::Discover => !extension.installed,
+                ExtensionTab::Installed => extension.installed,
+                ExtensionTab::Updates => {
+                    !extension.installed
+                        && self.extensions.iter().any(|installed| {
+                            installed.installed
+                                && installed.id == extension.id
+                                && same_extension_origin(&installed.origin, &extension.origin)
+                                && semver::Version::parse(&extension.version).ok()
+                                    > semver::Version::parse(&installed.version).ok()
+                        })
+                }
+            })
+            .filter(|extension| {
+                query.is_empty()
+                    || extension.name.to_ascii_lowercase().contains(&query)
+                    || extension.id.as_str().to_ascii_lowercase().contains(&query)
+                    || extension.description.to_ascii_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    pub(crate) fn render_extension_manager(&self, frame: &mut Frame, area: Rect) {
+        let Some(selected) = self.extension_manager else {
+            return;
+        };
+        let width = area.width.saturating_sub(8).min(90);
+        let height = area.height.saturating_sub(4).min(30);
+        let panel = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, panel);
+        let block = Block::default()
+            .title(" Extensions ")
+            .borders(Borders::ALL)
+            .padding(Padding::new(2, 2, 1, 1));
+        let inner = block.inner(panel);
+        frame.render_widget(block, panel);
+        let tabs = match self.extension_tab {
+            ExtensionTab::Discover => "[Discover]  Installed  Updates",
+            ExtensionTab::Installed => "Discover  [Installed]  Updates",
+            ExtensionTab::Updates => "Discover  Installed  [Updates]",
+        };
+        let mut lines = vec![
+            Line::from(tabs),
+            Line::styled(
+                format!("Search: {}_    ←→ tabs · Esc close", self.extension_search),
+                theme::dim(),
+            ),
+            Line::default(),
+        ];
+        if self.extension_disable_confirmation.is_some() {
+            lines.push(Line::styled(
+                "Any active autonomous work will be paused and unloaded. Press Enter to disable or Esc to cancel.",
+                theme::error(),
+            ));
+            lines.push(Line::default());
+        }
+        let visible = self.visible_extensions();
+        if visible.is_empty() {
+            lines.push(Line::from("No matching extensions."));
+        }
+        for (index, extension) in visible.into_iter().enumerate() {
+            let marker = if index == selected { "›" } else { " " };
+            let state = if self.extension_tab == ExtensionTab::Updates {
+                "Update available"
+            } else if !extension.installed {
+                "Not installed"
+            } else if extension.enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            };
+            let source = match &extension.origin {
+                tokio_agent_extension_api::ExtensionOrigin::OfficialRegistry { .. } => {
+                    "Official".to_owned()
+                }
+                tokio_agent_extension_api::ExtensionOrigin::ThirdPartyRegistry {
+                    registry, ..
+                } => format!("Third-party · {registry}"),
+                tokio_agent_extension_api::ExtensionOrigin::Local { .. } => "Local".to_owned(),
+            };
+            lines.push(Line::from(format!(
+                "{marker} {}  v{}",
+                extension.name, extension.version
+            )));
+            lines.push(Line::styled(
+                format!("  {} · {source} · {state}", extension.id),
+                theme::dim(),
+            ));
+            lines.push(Line::from(format!("  {}", extension.description)));
+            if index == selected {
+                if !extension.commands.is_empty() {
+                    lines.push(Line::styled(
+                        format!("  Commands: {}", extension.commands.join(", ")),
+                        theme::dim(),
+                    ));
+                }
+                if !extension.tools.is_empty() {
+                    lines.push(Line::styled(
+                        format!("  Model tools: {}", extension.tools.join(", ")),
+                        theme::dim(),
+                    ));
+                    lines.push(Line::styled(
+                        "  Context cost: tool schemas only while enabled/active",
+                        theme::dim(),
+                    ));
+                } else {
+                    lines.push(Line::styled(
+                        "  Context cost: none until invoked",
+                        theme::dim(),
+                    ));
+                }
+                if !extension.capabilities.is_empty() {
+                    let permissions = extension
+                        .capabilities
+                        .iter()
+                        .map(|capability| format!("{capability:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    lines.push(Line::styled(
+                        format!("  Permissions: {permissions}"),
+                        theme::dim(),
+                    ));
+                }
+            }
+            lines.push(Line::default());
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
     pub(crate) fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let left = match &self.pending {
             Some(_) => "approval required · esc to deny".to_owned(),
@@ -1142,7 +1439,76 @@ impl FrontendProjection {
             self.context_window.filter(|_| self.context_usage_known),
             self.last_request_usage.input_tokens,
         );
+        let left = status_left(&left, &self.status_segments, &right, width);
         frame.render_widget(Paragraph::new(footer_line(&left, &right, width)), area);
+    }
+}
+
+fn same_extension_origin(
+    left: &tokio_agent_extension_api::ExtensionOrigin,
+    right: &tokio_agent_extension_api::ExtensionOrigin,
+) -> bool {
+    match (left, right) {
+        (
+            tokio_agent_extension_api::ExtensionOrigin::OfficialRegistry { registry: left },
+            tokio_agent_extension_api::ExtensionOrigin::OfficialRegistry { registry: right },
+        ) => left == right,
+        (
+            tokio_agent_extension_api::ExtensionOrigin::ThirdPartyRegistry {
+                registry: left, ..
+            },
+            tokio_agent_extension_api::ExtensionOrigin::ThirdPartyRegistry {
+                registry: right, ..
+            },
+        ) => left == right,
+        (
+            tokio_agent_extension_api::ExtensionOrigin::Local { path: left },
+            tokio_agent_extension_api::ExtensionOrigin::Local { path: right },
+        ) => left == right,
+        _ => false,
+    }
+}
+
+fn status_left(base: &str, segments: &[StatusSegment], right: &str, width: usize) -> String {
+    let mut left = base.to_owned();
+    let reserved = right.width().saturating_add(2);
+    for segment in segments {
+        if segment.text.contains(['\n', '\r', '\u{1b}']) {
+            continue;
+        }
+        let text: String = segment.text.chars().take(160).collect();
+        let candidate = format!("{left}   [{text}]");
+        if candidate.width().saturating_add(reserved) <= width {
+            left = candidate;
+        }
+    }
+    left
+}
+
+fn extension_slash_command(descriptor: CommandDescriptor) -> SlashCommand {
+    let source = match &descriptor.source {
+        CommandSource::Extension { id, .. } => id.to_string(),
+        CommandSource::Local { .. } => "Local command".to_owned(),
+        CommandSource::BuiltIn => "Built in".to_owned(),
+    };
+    let action = match descriptor.id.as_str() {
+        "tokio.builtin:clear" => SlashAction::Clear,
+        "tokio.builtin:model" => SlashAction::Model,
+        "tokio.builtin:permissions" => SlashAction::Permissions,
+        "tokio.builtin:providers" => SlashAction::Provider,
+        "tokio.builtin:extensions" => SlashAction::Extensions,
+        _ => SlashAction::Extension(descriptor.id),
+    };
+    let description = if matches!(descriptor.source, CommandSource::BuiltIn) {
+        descriptor.description
+    } else {
+        format!("{} · {source}", descriptor.description)
+    };
+    SlashCommand {
+        name: Cow::Owned(descriptor.name),
+        description: Cow::Owned(description),
+        usage: descriptor.usage.map(Cow::Owned),
+        action,
     }
 }
 
@@ -1153,120 +1519,16 @@ fn command_usage_visible(command_name: &str, input: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
 
-fn slash_command_description(command: SlashCommand, fully_typed: bool) -> &'static str {
+fn slash_command_description(command: &SlashCommand, fully_typed: bool) -> Cow<'static, str> {
     if fully_typed {
-        match command.action {
-            SlashAction::Goal => "Usage: /goal <objective> (or pause, resume, cancel)",
-            SlashAction::Loop => "Usage: /loop <10s|5m|2h> <prompt> (or cancel)",
-            _ => command.description,
-        }
+        command
+            .usage
+            .as_ref()
+            .map(|usage| Cow::Owned(format!("Usage: {usage}")))
+            .unwrap_or_else(|| command.description.clone())
     } else {
-        command.description
+        command.description.clone()
     }
-}
-
-enum AutonomyCommandParse {
-    NotACommand,
-    Valid(UiCommand),
-    Invalid(String),
-}
-
-fn command_notice(command: &UiCommand) -> Option<&'static str> {
-    match command {
-        UiCommand::SetGoal(Some(_)) => Some("Goal started"),
-        UiCommand::SetGoal(None) => Some("Goal cancelled"),
-        UiCommand::PauseGoal => Some("Goal paused"),
-        UiCommand::ResumeGoal => Some("Goal resumed"),
-        UiCommand::SetLoop(Some(_)) => Some("Loop started"),
-        UiCommand::SetLoop(None) => Some("Loop cancelled"),
-        _ => None,
-    }
-}
-
-fn parse_autonomy_command(input: &str) -> AutonomyCommandParse {
-    if let Some(rest) = input
-        .strip_prefix("/goal")
-        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-    {
-        let argument = rest.trim();
-        return match argument {
-            "" => AutonomyCommandParse::Invalid(
-                "Enter an objective · example: /goal finish the migration".to_owned(),
-            ),
-            "clear" | "cancel" => AutonomyCommandParse::Valid(UiCommand::SetGoal(None)),
-            "pause" => AutonomyCommandParse::Valid(UiCommand::PauseGoal),
-            "resume" => AutonomyCommandParse::Valid(UiCommand::ResumeGoal),
-            objective => {
-                AutonomyCommandParse::Valid(UiCommand::SetGoal(Some(objective.to_owned())))
-            }
-        };
-    }
-    if let Some(rest) = input
-        .strip_prefix("/loop")
-        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-    {
-        let argument = rest.trim();
-        if argument.is_empty() {
-            return AutonomyCommandParse::Invalid(
-                "Enter an interval and prompt · example: /loop 5m check the deploy".to_owned(),
-            );
-        }
-        if matches!(argument, "cancel" | "clear" | "stop") {
-            return AutonomyCommandParse::Valid(UiCommand::SetLoop(None));
-        }
-
-        let Some((interval, prompt)) = argument.split_once(char::is_whitespace) else {
-            return match parse_loop_duration(argument) {
-                Ok(_) => AutonomyCommandParse::Invalid(
-                    "Enter a prompt to run after the interval · example: /loop 5m check the deploy"
-                        .to_owned(),
-                ),
-                Err(error) => AutonomyCommandParse::Invalid(error.to_owned()),
-            };
-        };
-        if matches!(interval, "cancel" | "clear" | "stop") {
-            return AutonomyCommandParse::Invalid(format!(
-                "`/loop {interval}` does not accept additional arguments"
-            ));
-        }
-        let interval = match parse_loop_duration(interval) {
-            Ok(interval) => interval,
-            Err(error) => return AutonomyCommandParse::Invalid(error.to_owned()),
-        };
-        let prompt = prompt.trim();
-        if prompt.is_empty() {
-            return AutonomyCommandParse::Invalid(
-                "Enter a prompt to run after the interval · example: /loop 5m check the deploy"
-                    .to_owned(),
-            );
-        }
-        return AutonomyCommandParse::Valid(UiCommand::SetLoop(Some((
-            interval,
-            prompt.to_owned(),
-        ))));
-    }
-    AutonomyCommandParse::NotACommand
-}
-
-fn parse_loop_duration(input: &str) -> Result<Duration, &'static str> {
-    let split = input
-        .find(|character: char| !character.is_ascii_digit())
-        .ok_or("Invalid interval · use a whole number such as 30s, 5m, or 2h")?;
-    let (amount, unit) = input.split_at(split);
-    let amount = amount
-        .parse::<u64>()
-        .map_err(|_| "Invalid interval · use a whole number such as 30s, 5m, or 2h")?;
-    let seconds = match unit {
-        "s" => amount.checked_mul(1),
-        "m" => amount.checked_mul(60),
-        "h" => amount.checked_mul(60 * 60),
-        _ => return Err("Invalid interval · use seconds, minutes, or hours: 30s, 5m, or 2h"),
-    }
-    .ok_or("Interval is too large")?;
-    if seconds < 10 {
-        return Err("Minimum loop interval is 10 seconds");
-    }
-    Ok(Duration::from_secs(seconds))
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
@@ -1362,8 +1624,8 @@ fn effort_options(provider: &str, model: &str) -> &'static [&'static str] {
     }
 }
 
-fn slash_command_name_width() -> usize {
-    SLASH_COMMANDS
+fn slash_command_name_width(commands: &[SlashCommand]) -> usize {
+    commands
         .iter()
         .map(|command| command.name.width())
         .max()
@@ -1586,9 +1848,11 @@ fn context_meter(context_window: Option<u64>, input_tokens: u64, expanded: bool)
     let filled = usize::try_from(percent.saturating_mul(BAR_WIDTH as u64).saturating_add(50) / 100)
         .unwrap_or(BAR_WIDTH)
         .min(BAR_WIDTH);
-    let usage = expanded
-        .then(|| format!(" ({} tokens)", compact_token_count(input_tokens)))
-        .unwrap_or_default();
+    let usage = if expanded {
+        format!(" ({} tokens)", compact_token_count(input_tokens))
+    } else {
+        String::new()
+    };
     format!(
         "{}{} {percent}%{usage}",
         "━".repeat(filled),
@@ -1655,6 +1919,55 @@ fn truncate_start(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
 
+    fn builtin_descriptors() -> Vec<CommandDescriptor> {
+        [
+            (
+                "tokio.builtin:clear",
+                "/clear",
+                "Clear the conversation and start fresh",
+            ),
+            (
+                "tokio.builtin:model",
+                "/model",
+                "Switch models for this session",
+            ),
+            (
+                "tokio.builtin:goal",
+                "/goal",
+                "Keep working autonomously until an objective is complete",
+            ),
+            (
+                "tokio.builtin:loop",
+                "/loop",
+                "Run a prompt repeatedly on an interval",
+            ),
+            (
+                "tokio.builtin:permissions",
+                "/permissions",
+                "Select how the agent asks for permission",
+            ),
+            (
+                "tokio.builtin:providers",
+                "/providers",
+                "Connect or switch AI providers",
+            ),
+        ]
+        .into_iter()
+        .map(|(id, name, description)| CommandDescriptor {
+            id: CommandId::new(id),
+            name: name.to_owned(),
+            description: description.to_owned(),
+            usage: match name {
+                "/goal" => Some("/goal <objective> | pause | resume | cancel".to_owned()),
+                "/loop" => Some("/loop <10s|5m|2h> <prompt> | cancel".to_owned()),
+                _ => None,
+            },
+            source: CommandSource::BuiltIn,
+            available_while_running: false,
+        })
+        .collect()
+    }
+
     fn projection() -> FrontendProjection {
         FrontendProjection::new(
             String::new(),
@@ -1664,6 +1977,8 @@ mod tests {
             None,
             0,
             Mode::Suggest,
+            Vec::new(),
+            builtin_descriptors(),
             Vec::new(),
         )
     }
@@ -1952,15 +2267,16 @@ mod tests {
 
     #[test]
     fn autonomy_command_descriptions_show_usage_only_when_fully_typed() {
-        let goal = SLASH_COMMANDS
+        let projection = projection();
+        let goal = projection
+            .extension_commands
             .iter()
             .find(|command| command.name == "/goal")
-            .copied()
             .expect("goal command");
-        let loop_command = SLASH_COMMANDS
+        let loop_command = projection
+            .extension_commands
             .iter()
             .find(|command| command.name == "/loop")
-            .copied()
             .expect("loop command");
 
         assert_eq!(
@@ -1973,12 +2289,45 @@ mod tests {
         );
         assert_eq!(
             slash_command_description(goal, true),
-            "Usage: /goal <objective> (or pause, resume, cancel)"
+            "Usage: /goal <objective> | pause | resume | cancel"
         );
         assert_eq!(
             slash_command_description(loop_command, true),
-            "Usage: /loop <10s|5m|2h> <prompt> (or cancel)"
+            "Usage: /loop <10s|5m|2h> <prompt> | cancel"
         );
+    }
+
+    #[test]
+    fn extension_commands_are_invoked_by_stable_id_and_unknown_slashes_stay_local() {
+        let mut projection = projection();
+        let descriptor = CommandDescriptor {
+            id: CommandId::new("local.project.review:review"),
+            name: "/review".into(),
+            description: "Review changes".into(),
+            usage: None,
+            source: CommandSource::Local {
+                path: "review.md".into(),
+            },
+            available_while_running: false,
+        };
+        projection
+            .extension_commands
+            .push(extension_slash_command(descriptor));
+        projection.composer.replace("/review tests");
+        assert!(matches!(
+            projection.submit(),
+            FrontendEffect::Command(UiCommand::InvokeCommand { id, arguments })
+                if id.as_str() == "local.project.review:review" && arguments == "tests"
+        ));
+
+        projection.running = false;
+        projection.composer.replace("/typo");
+        assert!(matches!(projection.submit(), FrontendEffect::None));
+        assert_eq!(
+            projection.command_error.as_deref(),
+            Some("Unknown command: /typo")
+        );
+        assert_eq!(projection.composer.text(), "/typo");
     }
 
     #[test]
@@ -2011,63 +2360,22 @@ mod tests {
     }
 
     #[test]
-    fn autonomy_commands_parse_goal_and_loop_controls() {
-        assert!(matches!(
-            parse_autonomy_command("/goal finish the migration"),
-            AutonomyCommandParse::Valid(UiCommand::SetGoal(Some(objective)))
-                if objective == "finish the migration"
-        ));
-        assert!(matches!(
-            parse_autonomy_command("/goal pause"),
-            AutonomyCommandParse::Valid(UiCommand::PauseGoal)
-        ));
-        assert!(matches!(
-            parse_autonomy_command("/loop 5m check the deploy"),
-            AutonomyCommandParse::Valid(UiCommand::SetLoop(Some((interval, prompt))))
-                if interval == Duration::from_secs(300) && prompt == "check the deploy"
-        ));
-        assert!(matches!(
-            parse_autonomy_command("/loop cancel"),
-            AutonomyCommandParse::Valid(UiCommand::SetLoop(None))
-        ));
-    }
-
-    #[test]
-    fn malformed_autonomy_commands_return_specific_errors() {
-        for (input, expected) in [
-            ("/goal", "Enter an objective"),
-            ("/loop", "Enter an interval and prompt"),
-            ("/loop .", "Invalid interval"),
-            ("/loop 5m", "Enter a prompt"),
-            ("/loop 2s too fast", "Minimum loop interval is 10 seconds"),
-            ("/loop cancel extra", "does not accept additional arguments"),
-        ] {
-            let AutonomyCommandParse::Invalid(error) = parse_autonomy_command(input) else {
-                panic!("expected invalid command for {input}");
-            };
-            assert!(
-                error.contains(expected),
-                "{error:?} did not contain {expected:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_autonomy_command_stays_in_composer() {
+    fn command_validation_errors_are_reported_by_the_shared_router() {
         let mut projection = projection();
         projection.composer.replace("/loop .");
 
-        assert!(matches!(projection.submit(), FrontendEffect::None));
-        assert_eq!(projection.composer.text(), "/loop .");
-        assert!(
-            projection
-                .command_error
-                .as_deref()
-                .is_some_and(|error| error.contains("Invalid interval"))
+        assert!(matches!(
+            projection.submit(),
+            FrontendEffect::Command(UiCommand::InvokeCommand { id, arguments })
+                if id.as_str() == "tokio.builtin:loop" && arguments == "."
+        ));
+        projection.apply(AgentEvent::CommandHandled(Err("Invalid interval".into())));
+        assert_eq!(
+            projection.command_error.as_deref(),
+            Some("Invalid interval")
         );
         assert_eq!(projection.command_feedback_height(), 2);
-        assert!(projection.history.is_empty());
-        assert_eq!(projection.transcript.len(), 0);
+        assert!(!projection.running);
     }
 
     #[test]
@@ -2084,6 +2392,7 @@ mod tests {
             projection.composer.replace(input);
 
             assert!(matches!(projection.submit(), FrontendEffect::Command(_)));
+            projection.apply(AgentEvent::CommandHandled(Ok(Some(expected.to_owned()))));
             assert_eq!(projection.active_command_notice(), Some(expected));
             assert_eq!(projection.command_feedback_height(), 2);
 
@@ -2099,7 +2408,7 @@ mod tests {
 
     #[test]
     fn slash_picker_spacing_tracks_the_longest_command_name() {
-        let width = slash_command_name_width();
+        let width = slash_command_name_width(&projection().extension_commands);
         assert_eq!(width, "/permissions".width());
         assert_eq!(
             format!("{:<width$}  {}", "/clear", "Clear conversation"),
@@ -2142,6 +2451,8 @@ mod tests {
             Some(300_000),
             8_192,
             Mode::FullAuto,
+            builtin_descriptors(),
+            Vec::new(),
         );
 
         assert_eq!(projection.transcript.len(), cells);
@@ -2447,6 +2758,8 @@ mod tests {
                 "from another directory".to_owned(),
                 "most recent".to_owned(),
             ],
+            Vec::new(),
+            Vec::new(),
         );
 
         projection.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));

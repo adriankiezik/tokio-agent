@@ -1,6 +1,6 @@
 [package]
 name = "tokio-agent-plugin"
-description = "Extension loader: skills, plugins, custom commands (v1)"
+description = "Extension discovery, validation, package store, and session supervision"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,12 +8,22 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tokio-agent-core.workspace = true
+tokio-agent-extension-api.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+dirs.workspace = true
+semver.workspace = true
+sha2.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

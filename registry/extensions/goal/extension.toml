@@ -1,0 +1,35 @@
+manifest_version = 1
+id = "tokio.official.goal"
+name = "Goal"
+version = "1.0.0"
+description = "Continue working until an objective is verified complete"
+license = "MIT"
+host_api = ">=1.0, <2.0"
+
+[runtime]
+component = "component/extension.wasm"
+
+[[commands]]
+name = "goal"
+description = "Work autonomously until an objective is complete"
+usage = "/goal <objective> | pause | resume | cancel"
+handler = "goal_command"
+
+[[tools]]
+name = "update_goal"
+description = "Mark the active goal complete or blocked"
+handler = "update_goal"
+activation = "dynamic"
+
+[[status]]
+id = "goal"
+side = "left"
+priority = 100
+handler = "goal_status"
+
+[capabilities]
+session_observe = true
+session_submit_automatic = true
+tools_dynamic = true
+status_write = true
+storage_session = true

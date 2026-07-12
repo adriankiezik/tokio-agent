@@ -1,0 +1,25 @@
+[package]
+name = "tokio-agent-registry-tool"
+description = "Static signed extension registry generator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio-agent-plugin.workspace = true
+tokio-agent-extension-api.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+tar.workspace = true
+flate2.workspace = true
+semver.workspace = true
+
+[lints]
+workspace = true

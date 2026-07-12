@@ -164,7 +164,10 @@ async fn run_turn_collecting(
             AgentEvent::ToolStarted { .. } => seq.push("tool_start"),
             AgentEvent::ToolFinished { .. } => seq.push("tool_result"),
             AgentEvent::TurnUsage(_) => seq.push("usage"),
-            AgentEvent::RequestUsage(_) => {}
+            AgentEvent::RequestUsage(_)
+            | AgentEvent::StatusSegments(_)
+            | AgentEvent::CommandCatalog(_)
+            | AgentEvent::CommandHandled(_) => {}
             AgentEvent::PermissionNeeded { id, .. } => {
                 seq.push("permission");
                 commands
