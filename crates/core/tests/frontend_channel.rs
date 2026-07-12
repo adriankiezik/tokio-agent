@@ -400,6 +400,122 @@ async fn interrupt_closes_dangling_calls_and_the_next_turn_gets_a_fresh_token() 
     })), "the interrupted transcript must close every model-issued tool call");
 }
 
+struct SteerableProvider {
+    calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<Request>>>,
+}
+
+impl Provider for SteerableProvider {
+    fn stream<'a>(
+        &'a self,
+        req: &'a Request,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<BoxStream<'static, Event>, ProviderError>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().unwrap().push(req.clone());
+        let event = async move {
+            if call == 0 {
+                cancel.cancelled().await;
+                Event::Done {
+                    stop: StopReason::Interrupted,
+                    message: Message {
+                        role: Role::Assistant,
+                        blocks: Vec::new(),
+                        usage: None,
+                    },
+                }
+            } else {
+                Event::Done {
+                    stop: StopReason::EndTurn,
+                    message: Message {
+                        role: Role::Assistant,
+                        blocks: vec![ContentBlock::Text {
+                            text: "steered".into(),
+                            meta: Default::default(),
+                        }],
+                        usage: None,
+                    },
+                }
+            }
+        };
+        Box::pin(async move { Ok(futures::stream::once(event).boxed()) })
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            tools: true,
+            streaming: true,
+            caching: false,
+            vision: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn steering_interrupts_sampling_and_continues_without_ending_the_turn() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        SteerableProvider {
+            calls: calls.clone(),
+            requests: requests.clone(),
+        },
+        Vec::new(),
+        PermissionEngine::new(Mode::Suggest),
+        ModelConfig {
+            model: "m".into(),
+            system: "s".into(),
+            max_tokens: 256,
+            reasoning_effort: None,
+        },
+        std::env::temp_dir(),
+    );
+    let (command_tx, command_rx) = unbounded_channel();
+    let (event_tx, mut event_rx) = unbounded_channel();
+    let session = tokio::spawn(agent.run(command_rx, event_tx));
+
+    command_tx
+        .send(UiCommand::UserMessage("initial task".into()))
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    command_tx
+        .send(UiCommand::Steer("prioritize tests".into()))
+        .unwrap();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let AgentEvent::TurnDone(result) = event_rx.recv().await.unwrap() {
+                break result;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, Ok(StopReason::EndTurn)));
+    command_tx.send(UiCommand::Shutdown).unwrap();
+    session.await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let user_text = requests[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(user_text, ["initial task", "prioritize tests"]);
+}
+
 struct ParallelProvider {
     calls: AtomicUsize,
     followup: Arc<Mutex<Option<Request>>>,

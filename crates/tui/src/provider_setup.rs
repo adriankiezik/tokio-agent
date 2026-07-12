@@ -9,7 +9,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
-use tokio_agent_config::{AuthKind, Config, ProviderKind};
+use tokio_agent_config::{AuthKind, Config, ConfigError, ProviderKind};
 
 use crate::theme;
 
@@ -92,7 +92,7 @@ pub fn configure_provider(cwd: &Path) -> io::Result<bool> {
         .enable_all()
         .build()?;
     let mut terminal = ratatui::init();
-    let result = configure_provider_on(&mut terminal, &runtime, cwd, false, None);
+    let result = configure_provider_on(&mut terminal, &runtime, cwd, false, false, None);
     ratatui::restore();
     result
 }
@@ -103,7 +103,15 @@ pub(crate) fn configure_provider_in(
     cwd: &Path,
     draw_background: &mut dyn FnMut(&mut Frame, u16) -> Rect,
 ) -> io::Result<bool> {
-    configure_provider_on(terminal, runtime, cwd, true, Some(draw_background))
+    configure_provider_on(terminal, runtime, cwd, true, true, Some(draw_background))
+}
+
+pub(crate) fn configure_provider_with_terminal(
+    terminal: &mut DefaultTerminal,
+    runtime: &tokio::runtime::Runtime,
+    cwd: &Path,
+) -> io::Result<bool> {
+    configure_provider_on(terminal, runtime, cwd, true, false, None)
 }
 
 fn configure_provider_on(
@@ -111,14 +119,16 @@ fn configure_provider_on(
     runtime: &tokio::runtime::Runtime,
     cwd: &Path,
     restore_mouse_capture: bool,
+    active_credential_available: bool,
     draw_background: Option<DrawBackground<'_>>,
 ) -> io::Result<bool> {
     let config = Config::load(cwd)
         .ok()
         .and_then(|config| config.resolve().ok());
+    let signed_in = tokio_agent_auth::is_signed_in();
     let active = config.as_ref().map(|config| {
-        let auth = config.auth.unwrap_or_else(|| match config.provider {
-            ProviderKind::OpenAi if tokio_agent_auth::is_signed_in() => AuthKind::ChatGpt,
+        let auth = config.auth.unwrap_or(match config.provider {
+            ProviderKind::OpenAi if signed_in => AuthKind::ChatGpt,
             _ => AuthKind::ApiKey,
         });
         (config.provider, auth)
@@ -137,12 +147,15 @@ fn configure_provider_on(
         active,
         active_model,
         active_effort,
-        connected: [
-            tokio_agent_auth::is_signed_in(),
-            tokio_agent_config::api_key("openai").is_ok(),
-            tokio_agent_config::api_key("anthropic").is_ok(),
-            tokio_agent_config::api_key("deepseek").is_ok(),
-        ],
+        connected: OPTIONS.map(|option| match option.auth {
+            AuthKind::ChatGpt => signed_in,
+            AuthKind::ApiKey => {
+                (active_credential_available && active == Some((option.provider, AuthKind::ApiKey)))
+                    || tokio_agent_config::api_key_available_without_prompt(
+                        option.provider.as_str(),
+                    )
+            }
+        }),
         message: None,
     };
     execute!(io::stdout(), DisableMouseCapture)?;
@@ -162,14 +175,7 @@ impl Setup {
         mut draw_background: Option<DrawBackground<'_>>,
     ) -> io::Result<bool> {
         loop {
-            terminal.draw(|frame| {
-                if let Some(draw_background) = &mut draw_background {
-                    let area = draw_background(frame, self.panel_height());
-                    self.render_in(frame, area);
-                } else {
-                    self.render(frame);
-                }
-            })?;
+            self.draw_frame(terminal, &mut draw_background)?;
             if !event::poll(Duration::from_millis(16))? {
                 continue;
             }
@@ -211,7 +217,7 @@ impl Setup {
                                 continue;
                             }
                             self.message = Some(("Waiting for browser sign-in…".to_owned(), false));
-                            terminal.draw(|frame| self.render(frame))?;
+                            self.draw_frame(terminal, &mut draw_background)?;
                             match runtime.block_on(tokio_agent_auth::login_silent()) {
                                 Ok(outcome) => {
                                     let identity = outcome.email.map_or_else(
@@ -241,11 +247,26 @@ impl Setup {
                                 return Ok(true);
                             }
                         } else {
-                            self.screen = Screen::ApiKey {
-                                option: self.selected,
-                                key: String::new(),
-                            };
-                            self.message = None;
+                            match tokio_agent_config::prepare_api_key(option.provider.as_str()) {
+                                Ok(()) => {
+                                    self.connected[self.selected] = true;
+                                    if let Err(error) = self.activate(option) {
+                                        self.message = Some((error, true));
+                                    } else {
+                                        return Ok(true);
+                                    }
+                                }
+                                Err(ConfigError::MissingKey(..)) => {
+                                    self.screen = Screen::ApiKey {
+                                        option: self.selected,
+                                        key: String::new(),
+                                    };
+                                    self.message = None;
+                                }
+                                Err(error) => {
+                                    self.message = Some((error.to_string(), true));
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -294,6 +315,22 @@ impl Setup {
         }
     }
 
+    fn draw_frame(
+        &self,
+        terminal: &mut DefaultTerminal,
+        draw_background: &mut Option<DrawBackground<'_>>,
+    ) -> io::Result<()> {
+        terminal.draw(|frame| {
+            if let Some(draw_background) = draw_background.as_deref_mut() {
+                let area = draw_background(frame, self.panel_height());
+                self.render_in(frame, area);
+            } else {
+                self.render(frame);
+            }
+        })?;
+        Ok(())
+    }
+
     fn activate(&mut self, option: ProviderOption) -> Result<(), String> {
         let (model, effort) = settings_for_provider(
             option,
@@ -328,7 +365,7 @@ impl Setup {
 
     fn panel_height(&self) -> u16 {
         match self.screen {
-            Screen::Providers => 10,
+            Screen::Providers => 9,
             Screen::ApiKey { .. } | Screen::Success { .. } => 7,
         }
     }

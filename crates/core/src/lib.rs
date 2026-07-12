@@ -9,7 +9,7 @@ mod sleep;
 pub mod tool;
 mod tool_execution;
 
-pub use agent::{Agent, AgentError, AgentEvent, ModelConfig, UiCommand};
+pub use agent::{Agent, AgentError, AgentEvent, AgentState, ModelConfig, UiCommand};
 pub use context::ContextAssembler;
 pub use event::Event;
 pub use message::{ContentBlock, Message, ProviderMetadata, Role};

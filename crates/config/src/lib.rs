@@ -1,13 +1,16 @@
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-const KEYCHAIN_SERVICE: &str = "tokio-agent";
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 const DEFAULT_REASONING_EFFORT: &str = "medium";
 const DEFAULT_PERMISSION_MODE: &str = "suggest";
 const MAX_RECENT_MESSAGES: usize = 100;
+
+static API_KEY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -31,10 +34,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("no API key for provider '{0}': set {1} or store one in the keychain")]
+    #[error("no API key for provider '{0}': set {1} or connect the provider")]
     MissingKey(String, String),
-    #[error("keychain error: {0}")]
-    Keychain(String),
     #[error("unknown provider '{0}' — supported providers: anthropic, openai, deepseek")]
     UnknownProvider(String),
     #[error("unknown auth '{0}' — use \"chatgpt\" or \"api_key\"")]
@@ -423,6 +424,10 @@ fn history_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("tokio-agent").join("history.json"))
 }
 
+fn api_key_store_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("tokio-agent").join("api-keys.json"))
+}
+
 fn ensure_parent(path: &Path) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
@@ -496,30 +501,151 @@ fn env_var_for(provider: &str) -> String {
     format!("{}_API_KEY", provider.to_uppercase())
 }
 
-pub fn api_key(provider: &str) -> Result<String, ConfigError> {
-    let var = env_var_for(provider);
-    if let Ok(key) = std::env::var(&var)
-        && !key.is_empty()
-    {
-        return Ok(key);
-    }
+fn api_key_from_env(provider: &str) -> Option<String> {
+    std::env::var(env_var_for(provider))
+        .ok()
+        .filter(|key| !key.is_empty())
+}
 
-    match keyring::Entry::new(KEYCHAIN_SERVICE, provider) {
-        Ok(entry) => match entry.get_password() {
-            Ok(key) => Ok(key),
-            Err(keyring::Error::NoEntry) => Err(ConfigError::MissingKey(provider.to_owned(), var)),
-            Err(e) => Err(ConfigError::Keychain(e.to_string())),
-        },
-        Err(e) => Err(ConfigError::Keychain(e.to_string())),
+fn api_key_cache() -> &'static Mutex<HashMap<String, String>> {
+    API_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_api_key_cache() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
+    api_key_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ApiKeyStore {
+    #[serde(default)]
+    api_keys: BTreeMap<String, String>,
+}
+
+fn read_api_key_store_at(path: &Path) -> Result<ApiKeyStore, ConfigError> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|source| ConfigError::StateParse {
+            path: path.to_owned(),
+            source,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ApiKeyStore::default()),
+        Err(source) => Err(ConfigError::Read {
+            path: path.to_owned(),
+            source,
+        }),
     }
 }
 
+#[cfg(unix)]
+fn write_api_key_store_at(path: &Path, store: &ApiKeyStore) -> Result<(), ConfigError> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    ensure_parent(path)?;
+    let bytes = serde_json::to_vec(store).map_err(|error| ConfigError::Write {
+        path: path.to_owned(),
+        source: std::io::Error::other(error),
+    })?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|source| ConfigError::Write {
+            path: path.to_owned(),
+            source,
+        })?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| file.write_all(&bytes))
+        .map_err(|source| ConfigError::Write {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn write_api_key_store_at(path: &Path, store: &ApiKeyStore) -> Result<(), ConfigError> {
+    ensure_parent(path)?;
+    let bytes = serde_json::to_vec(store).map_err(|error| ConfigError::Write {
+        path: path.to_owned(),
+        source: std::io::Error::other(error),
+    })?;
+    std::fs::write(path, bytes).map_err(|source| ConfigError::Write {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn store_api_key_at(path: &Path, provider: &str, key: &str) -> Result<(), ConfigError> {
+    let mut store = read_api_key_store_at(path)?;
+    store.api_keys.insert(provider.to_owned(), key.to_owned());
+    write_api_key_store_at(path, &store)
+}
+
+fn api_key_from_store(provider: &str) -> Result<Option<String>, ConfigError> {
+    let Some(path) = api_key_store_path() else {
+        return Ok(None);
+    };
+    Ok(read_api_key_store_at(&path)?
+        .api_keys
+        .remove(provider)
+        .filter(|key| !key.is_empty()))
+}
+
+#[must_use]
+pub fn api_key_available_without_prompt(provider: &str) -> bool {
+    api_key_from_env(provider).is_some()
+        || lock_api_key_cache().contains_key(provider)
+        || api_key_store_path().is_some_and(|path| {
+            read_api_key_store_at(&path).is_ok_and(|state| {
+                state
+                    .api_keys
+                    .get(provider)
+                    .is_some_and(|key| !key.is_empty())
+            })
+        })
+}
+
+pub fn prepare_api_key(provider: &str) -> Result<(), ConfigError> {
+    api_key(provider).map(drop)
+}
+
+fn api_key_from_cache_or_load(
+    provider: &str,
+    load: impl FnOnce() -> Result<String, ConfigError>,
+) -> Result<String, ConfigError> {
+    let mut keys = lock_api_key_cache();
+    if let Some(key) = keys.get(provider) {
+        return Ok(key.clone());
+    }
+
+    let key = load()?;
+    keys.insert(provider.to_owned(), key.clone());
+    Ok(key)
+}
+
+pub fn api_key(provider: &str) -> Result<String, ConfigError> {
+    if let Some(key) = api_key_from_env(provider) {
+        return Ok(key);
+    }
+
+    api_key_from_cache_or_load(provider, || {
+        api_key_from_store(provider)?
+            .ok_or_else(|| ConfigError::MissingKey(provider.to_owned(), env_var_for(provider)))
+    })
+}
+
 pub fn store_api_key(provider: &str, key: &str) -> Result<(), ConfigError> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, provider)
-        .map_err(|e| ConfigError::Keychain(e.to_string()))?;
-    entry
-        .set_password(key)
-        .map_err(|e| ConfigError::Keychain(e.to_string()))
+    let path = api_key_store_path().ok_or_else(|| ConfigError::Write {
+        path: PathBuf::from("api-keys.json"),
+        source: std::io::Error::other("configuration directory is unavailable"),
+    })?;
+    store_api_key_at(&path, provider, key)?;
+    lock_api_key_cache().insert(provider.to_owned(), key.to_owned());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -650,5 +776,57 @@ mod tests {
         assert_eq!(messages.first().map(String::as_str), Some("message 0"));
         assert_eq!(messages.last().map(String::as_str), Some("message 99"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn api_key_store_round_trips_multiple_providers() {
+        let path = temp_path("api-keys.json");
+
+        store_api_key_at(&path, "deepseek", "deepseek-secret").unwrap();
+        store_api_key_at(&path, "anthropic", "anthropic-secret").unwrap();
+
+        let store = read_api_key_store_at(&path).unwrap();
+        assert_eq!(store.api_keys.get("deepseek").unwrap(), "deepseek-secret");
+        assert_eq!(store.api_keys.get("anthropic").unwrap(), "anthropic-secret");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_key_store_is_user_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("private-api-keys.json");
+        store_api_key_at(&path, "deepseek", "test-secret").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_cached_api_key_is_reused_without_another_store_load() {
+        let provider = format!(
+            "cache-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+
+        let first = api_key_from_cache_or_load(&provider, || {
+            loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok("test-secret".to_owned())
+        });
+        let second = api_key_from_cache_or_load(&provider, || {
+            loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok("different-secret".to_owned())
+        });
+
+        assert_eq!(first.unwrap(), "test-secret");
+        assert_eq!(second.unwrap(), "test-secret");
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(api_key_available_without_prompt(&provider));
     }
 }

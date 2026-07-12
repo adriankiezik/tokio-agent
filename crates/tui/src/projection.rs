@@ -40,7 +40,6 @@ struct SlashCommand {
 #[derive(Clone, Copy)]
 enum SlashAction {
     Clear,
-    Effort,
     Model,
     Goal,
     Loop,
@@ -48,16 +47,11 @@ enum SlashAction {
     Provider,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 7] = [
+const SLASH_COMMANDS: [SlashCommand; 6] = [
     SlashCommand {
         name: "/clear",
         description: "Clear the conversation and start fresh",
         action: SlashAction::Clear,
-    },
-    SlashCommand {
-        name: "/effort",
-        description: "Select the model's reasoning effort",
-        action: SlashAction::Effort,
     },
     SlashCommand {
         name: "/model",
@@ -149,6 +143,7 @@ pub(crate) struct FrontendProjection {
     setting_picker: Option<SettingPicker>,
     provider_change_notice: bool,
     last_request_usage: Usage,
+    context_usage_known: bool,
     quit_armed_until: Option<Instant>,
     scroll_button_area: Option<Rect>,
 }
@@ -189,9 +184,39 @@ impl FrontendProjection {
             setting_picker: None,
             provider_change_notice: false,
             last_request_usage: Usage::default(),
+            context_usage_known: true,
             quit_armed_until: None,
             scroll_button_area: None,
         }
+    }
+
+    pub(crate) fn update_session(
+        &mut self,
+        provider: String,
+        model: String,
+        effort: Option<String>,
+        cwd: String,
+        context_window: Option<u64>,
+        max_output_tokens: u32,
+        permission_mode: Mode,
+    ) {
+        self.provider = provider;
+        self.model = model;
+        self.effort = effort;
+        self.cwd = cwd;
+        self.context_window = context_window;
+        self.max_output_tokens = max_output_tokens;
+        self.permission_mode = permission_mode;
+        self.pending = None;
+        self.running = false;
+        self.interrupting = false;
+        self.setting_picker = None;
+        self.permissions_selected = None;
+        self.provider_change_notice = false;
+        self.started_at = None;
+        self.elapsed = Duration::ZERO;
+        self.last_request_usage = Usage::default();
+        self.context_usage_known = self.transcript.len() == 0;
     }
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> FrontendEffect {
@@ -323,6 +348,14 @@ impl FrontendProjection {
                                 )
                             });
                         self.model = model.clone();
+                        let efforts = self.effort_options();
+                        if !efforts.is_empty() {
+                            let selected = efforts
+                                .iter()
+                                .position(|effort| Some(*effort) == self.effort.as_deref())
+                                .unwrap_or_default();
+                            self.setting_picker = Some(SettingPicker::Effort(selected));
+                        }
                         Some(FrontendEffect::Command(UiCommand::SetModel(model)))
                     }
                 }
@@ -407,7 +440,7 @@ impl FrontendProjection {
                 self.composer.insert_newline();
                 FrontendEffect::None
             }
-            KeyCode::Enter if !self.running => self.submit(),
+            KeyCode::Enter => self.submit(),
             KeyCode::Backspace => {
                 self.composer.backspace();
                 self.leave_history();
@@ -546,9 +579,6 @@ impl FrontendProjection {
             .copied()
             .filter(|command| command.name.starts_with(query))
             .filter(|command| {
-                !matches!(command.action, SlashAction::Effort) || !self.effort_options().is_empty()
-            })
-            .filter(|command| {
                 !matches!(command.action, SlashAction::Model) || !self.model_options().is_empty()
             })
             .collect()
@@ -572,16 +602,8 @@ impl FrontendProjection {
                 self.transcript.clear();
                 self.scroll_up = 0;
                 self.last_request_usage = Usage::default();
+                self.context_usage_known = true;
                 FrontendEffect::Command(UiCommand::Clear)
-            }
-            SlashAction::Effort => {
-                let selected = self
-                    .effort_options()
-                    .iter()
-                    .position(|effort| Some(*effort) == self.effort.as_deref())
-                    .unwrap_or_default();
-                self.setting_picker = Some(SettingPicker::Effort(selected));
-                FrontendEffect::None
             }
             SlashAction::Model => {
                 let selected = self
@@ -637,8 +659,14 @@ impl FrontendProjection {
             self.history.push(message.clone());
         }
         self.leave_history();
-        self.begin_turn(&message);
-        FrontendEffect::Command(UiCommand::UserMessage(message))
+        if self.running {
+            self.transcript.push_user(message.clone());
+            self.scroll_up = 0;
+            FrontendEffect::Command(UiCommand::Steer(message))
+        } else {
+            self.begin_turn(&message);
+            FrontendEffect::Command(UiCommand::UserMessage(message))
+        }
     }
 
     pub(crate) fn composer_height(&self, width: u16) -> u16 {
@@ -884,7 +912,10 @@ impl FrontendProjection {
                 }
             }
             AgentEvent::TurnUsage(usage) => self.usage = usage,
-            AgentEvent::RequestUsage(usage) => self.last_request_usage = usage,
+            AgentEvent::RequestUsage(usage) => {
+                self.last_request_usage = usage;
+                self.context_usage_known = true;
+            }
             AgentEvent::PermissionNeeded { id, request } => {
                 self.pause_elapsed_timer();
                 self.pending = Some(Pending { id, request });
@@ -1024,7 +1055,7 @@ impl FrontendProjection {
         let right = footer_status(
             &left,
             width,
-            self.context_window,
+            self.context_window.filter(|_| self.context_usage_known),
             self.last_request_usage.input_tokens,
         );
         frame.render_widget(Paragraph::new(footer_line(&left, &right, width)), area);
@@ -1077,8 +1108,26 @@ fn parse_loop_duration(input: &str) -> Option<Duration> {
     (seconds >= 10).then(|| Duration::from_secs(seconds))
 }
 
+fn format_elapsed(elapsed: Duration) -> String {
+    let total_seconds = elapsed.as_secs();
+    let days = total_seconds / (24 * 60 * 60);
+    let hours = (total_seconds / (60 * 60)) % 24;
+    let minutes = (total_seconds / 60) % 60;
+    let seconds = total_seconds % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m {seconds}s")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn working_indicator_line(elapsed: Duration, interrupting: bool) -> Line<'static> {
-    let elapsed = format!("{}s", elapsed.as_secs());
+    let elapsed = format_elapsed(elapsed);
     let (activity, hint) = if interrupting {
         ("Interrupting…", "ctrl-c to force exit")
     } else {
@@ -1366,9 +1415,8 @@ fn footer_status(
 fn context_meter(context_window: Option<u64>, input_tokens: u64, expanded: bool) -> String {
     const BAR_WIDTH: usize = 8;
 
-    let label = if expanded { "context" } else { "ctx" };
     let Some(capacity) = context_window.filter(|capacity| *capacity > 0) else {
-        return format!("{label} {} N/A", "─".repeat(BAR_WIDTH));
+        return format!("{} N/A", "─".repeat(BAR_WIDTH));
     };
     let percent = input_tokens
         .saturating_mul(100)
@@ -1377,11 +1425,31 @@ fn context_meter(context_window: Option<u64>, input_tokens: u64, expanded: bool)
     let filled = usize::try_from(percent.saturating_mul(BAR_WIDTH as u64).saturating_add(50) / 100)
         .unwrap_or(BAR_WIDTH)
         .min(BAR_WIDTH);
+    let usage = expanded
+        .then(|| format!(" ({} tokens)", compact_token_count(input_tokens)))
+        .unwrap_or_default();
     format!(
-        "{label} {}{} {percent}%",
+        "{}{} {percent}%{usage}",
         "━".repeat(filled),
         "─".repeat(BAR_WIDTH - filled),
     )
+}
+
+fn compact_token_count(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+
+    let (value, suffix) = if tokens < 1_000_000 {
+        (tokens, "k")
+    } else {
+        (tokens / 1_000, "m")
+    };
+    if value % 1_000 == 0 {
+        format!("{}{suffix}", value / 1_000)
+    } else {
+        format!("{}.{:01}{suffix}", value / 1_000, value % 1_000 / 100)
+    }
 }
 
 fn session_context(model: &str, effort: Option<&str>, cwd: &str) -> String {
@@ -1573,10 +1641,20 @@ mod tests {
     }
 
     #[test]
+    fn elapsed_time_uses_seconds_minutes_hours_and_days() {
+        assert_eq!(format_elapsed(Duration::ZERO), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_elapsed(Duration::from_secs(520)), "8m 40s");
+        assert_eq!(format_elapsed(Duration::from_secs(3_661)), "1h 1m 1s");
+        assert_eq!(format_elapsed(Duration::from_secs(90_061)), "1d 1h 1m 1s");
+    }
+
+    #[test]
     fn working_indicator_contains_elapsed_time_and_interrupt_hint() {
         assert_eq!(
-            working_indicator_line(Duration::from_secs(18), false).to_string(),
-            "• Working (18s • esc to interrupt)"
+            working_indicator_line(Duration::from_secs(520), false).to_string(),
+            "• Working (8m 40s • esc to interrupt)"
         );
         assert_eq!(
             working_indicator_line(Duration::from_secs(18), true).to_string(),
@@ -1608,10 +1686,14 @@ mod tests {
     fn context_meter_uses_an_eight_cell_rounded_bar() {
         assert_eq!(
             context_meter(Some(100_000), 62_000, true),
-            "context ━━━━━─── 62%"
+            "━━━━━─── 62% (62k tokens)"
         );
-        assert_eq!(context_meter(Some(100_000), 0, false), "ctx ──────── 0%");
-        assert_eq!(context_meter(None, 10, true), "context ──────── N/A");
+        assert_eq!(
+            context_meter(Some(200_000), 124_000, true),
+            "━━━━━─── 62% (124k tokens)"
+        );
+        assert_eq!(context_meter(Some(100_000), 0, false), "──────── 0%");
+        assert_eq!(context_meter(None, 10, true), "──────── N/A");
         assert_eq!(
             context_before_compaction("openai", 372_000, 32_000),
             334_800
@@ -1622,21 +1704,21 @@ mod tests {
         );
         assert_eq!(
             context_meter(Some(334_800), 334_800, true),
-            "context ━━━━━━━━ 100%"
+            "━━━━━━━━ 100% (334.8k tokens)"
         );
     }
 
     #[test]
-    fn footer_always_keeps_context_and_expands_the_label_when_it_fits() {
+    fn footer_always_keeps_meter_and_expands_token_count_when_it_fits() {
         let wide = footer_status("gpt-5 · ~/micro", 80, Some(100), 62);
-        assert_eq!(wide, "context ━━━━━─── 62%");
+        assert_eq!(wide, "━━━━━─── 62% (62 tokens)");
 
         let narrow = footer_status("gpt-5 · ~/a/long/project/path", 35, Some(100), 62);
-        assert_eq!(narrow, "ctx ━━━━━─── 62%");
+        assert_eq!(narrow, "━━━━━─── 62%");
         assert!(
             footer_line("long left status", &narrow, 20)
                 .to_string()
-                .contains("ctx ━━━━━─── 62%")
+                .contains("━━━━━─── 62%")
         );
     }
 
@@ -1686,7 +1768,7 @@ mod tests {
                 projection.context_window,
                 projection.last_request_usage.input_tokens,
             ),
-            "context ━━━━━─── 62%"
+            "━━━━━─── 62% (62k tokens)"
         );
 
         projection.composer.replace("/clear");
@@ -1703,7 +1785,7 @@ mod tests {
                 projection.context_window,
                 projection.last_request_usage.input_tokens,
             ),
-            "context ──────── 0%"
+            "──────── 0% (0 tokens)"
         );
     }
 
@@ -1752,6 +1834,60 @@ mod tests {
         assert_eq!(
             permission_mode_indicator(Mode::AutoEdit, Mode::Suggest),
             "  "
+        );
+    }
+
+    #[test]
+    fn provider_session_update_preserves_rendered_conversation() {
+        let mut projection = projection();
+        projection.begin_turn("keep this visible");
+        projection.apply(AgentEvent::TextDelta("still here".into()));
+        projection.apply(AgentEvent::RequestUsage(Usage {
+            input_tokens: 62_000,
+            ..Usage::default()
+        }));
+        let cells = projection.transcript.len();
+
+        projection.update_session(
+            "openai".into(),
+            "gpt-5.6-sol".into(),
+            Some("high".into()),
+            "/tmp".into(),
+            Some(300_000),
+            8_192,
+            Mode::FullAuto,
+        );
+
+        assert_eq!(projection.transcript.len(), cells);
+        assert_eq!(projection.provider, "openai");
+        assert_eq!(projection.model, "gpt-5.6-sol");
+        assert!(!projection.running);
+        assert_eq!(
+            footer_status(
+                "gpt-5.6-sol · /tmp",
+                80,
+                projection
+                    .context_window
+                    .filter(|_| projection.context_usage_known),
+                projection.last_request_usage.input_tokens,
+            ),
+            "──────── N/A"
+        );
+
+        projection.apply(AgentEvent::RequestUsage(Usage {
+            input_tokens: 30_000,
+            ..Usage::default()
+        }));
+        assert_eq!(
+            footer_status(
+                "gpt-5.6-sol · /tmp",
+                80,
+                projection
+                    .context_window
+                    .filter(|_| projection.context_usage_known),
+                projection.last_request_usage.input_tokens,
+            ),
+            "━─────── 10% (30k tokens)"
         );
     }
 
@@ -1838,23 +1974,48 @@ mod tests {
     }
 
     #[test]
-    fn effort_command_is_only_available_for_supported_models() {
+    fn model_selection_immediately_opens_effort_picker() {
         let mut projection = projection();
-        projection.provider = "anthropic".into();
-        projection.model = "claude-haiku-4-5".into();
-        projection.composer.replace("/effort");
-        assert!(projection.slash_matches().is_empty());
-
         projection.provider = "deepseek".into();
-        projection.model = "deepseek-v4-pro".into();
+        projection.model = "deepseek-v4-flash".into();
         projection.effort = Some("high".into());
-        assert_eq!(projection.slash_matches().len(), 1);
+        projection.composer.replace("/model");
+
         projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        projection.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            FrontendEffect::Command(UiCommand::SetModel(model)) if model == "deepseek-v4-pro"
+        ));
+        assert_eq!(projection.permissions_panel_height(), 4);
+
         projection.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert!(matches!(
             projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             FrontendEffect::Command(UiCommand::SetReasoningEffort(Some(effort))) if effort == "max"
         ));
+    }
+
+    #[test]
+    fn effort_is_not_a_slash_command() {
+        let mut projection = projection();
+        projection.composer.replace("/effort");
+        assert!(projection.slash_matches().is_empty());
+    }
+
+    #[test]
+    fn enter_steers_a_running_turn() {
+        let mut projection = projection();
+        projection.running = true;
+        projection.composer.replace("check the failing test first");
+
+        assert!(matches!(
+            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            FrontendEffect::Command(UiCommand::Steer(message))
+                if message == "check the failing test first"
+        ));
+        assert!(projection.running);
+        assert!(projection.composer.text().is_empty());
     }
 
     #[test]

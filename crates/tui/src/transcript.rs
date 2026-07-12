@@ -54,6 +54,10 @@ impl Transcript {
         self.cells.push(Cell::User(text));
     }
 
+    pub(super) fn len(&self) -> usize {
+        self.cells.len()
+    }
+
     pub(super) fn clear(&mut self) {
         self.cells.clear();
         self.hovered_tool = None;

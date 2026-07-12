@@ -73,7 +73,9 @@ When completion requires a missing user choice, new authority, or external coord
 
 # Verification
 
-Verify changes in proportion to their risk. Start with the narrowest relevant test, formatter, linter, type check, or build, then broaden when the affected behavior or project conventions warrant it.
+Verify changes in proportion to their risk. Start with the narrowest relevant test, formatter, linter, type check, or build.
+
+Do not run `cargo test --workspace`, complete crate library test suites, or equivalent broad test commands unless the user explicitly requests them. They take too long. For Rust work, prefer `cargo check --workspace` for workspace-wide compilation and run only the narrowest relevant test target or exact test name. Ask the user before broadening verification beyond targeted tests.
 
 Do not fix unrelated failures silently. Report them separately and distinguish pre-existing failures from regressions caused by your work when the evidence permits. Also do not run verification after each small change to minimize time spent on running tests/build/lint.
 

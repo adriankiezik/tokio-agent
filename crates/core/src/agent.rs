@@ -44,6 +44,7 @@ pub enum AgentEvent {
 #[derive(Debug)]
 pub enum UiCommand {
     UserMessage(String),
+    Steer(String),
     SetGoal(Option<String>),
     PauseGoal,
     ResumeGoal,
@@ -78,6 +79,19 @@ pub struct ModelConfig {
     pub system: String,
     pub max_tokens: u32,
     pub reasoning_effort: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct AgentState {
+    transcript: Vec<Message>,
+    last_input_tokens: u64,
+}
+
+impl AgentState {
+    #[must_use]
+    pub fn transcript(&self) -> &[Message] {
+        &self.transcript
+    }
 }
 
 pub struct Agent<P: Provider> {
@@ -162,6 +176,20 @@ impl<P: Provider> Agent<P> {
         self
     }
 
+    #[must_use]
+    pub fn with_state(mut self, state: AgentState) -> Self {
+        self.context.replace_transcript(state.transcript);
+        self.last_input_tokens = state.last_input_tokens;
+        self
+    }
+
+    fn into_state(self) -> AgentState {
+        AgentState {
+            transcript: self.context.transcript().to_vec(),
+            last_input_tokens: self.last_input_tokens,
+        }
+    }
+
     pub fn provider_name(&self) -> &str {
         &self.provider_name
     }
@@ -208,14 +236,14 @@ impl<P: Provider> Agent<P> {
         mut self,
         mut commands: UnboundedReceiver<UiCommand>,
         events: UnboundedSender<AgentEvent>,
-    ) {
+    ) -> AgentState {
         let mut queued: VecDeque<(String, bool)> = VecDeque::new();
         loop {
             let (input, automatic) = match queued.pop_front() {
                 Some(input) => input,
                 None => match self.next_idle_input(&mut commands).await {
                     Some(input) => input,
-                    None => return,
+                    None => return self.into_state(),
                 },
             };
             let _sleep_inhibitor = crate::sleep::SleepInhibitor::acquire();
@@ -225,6 +253,8 @@ impl<P: Provider> Agent<P> {
 
             let cancel = CancellationToken::new();
             let permissions = self.permissions.clone();
+            let mut steering = false;
+            let mut shutting_down = false;
             let result = {
                 let turn = self.drive(input, &events, cancel.clone());
                 tokio::pin!(turn);
@@ -234,6 +264,11 @@ impl<P: Provider> Agent<P> {
                         command = commands.recv() => match command {
                             Some(UiCommand::Interrupt) => cancel.cancel(),
                             Some(UiCommand::Approve { id, decision }) => permissions.resolve(id, decision),
+                            Some(UiCommand::Steer(input)) => {
+                                queued.push_back((input, false));
+                                steering = true;
+                                cancel.cancel();
+                            }
                             Some(UiCommand::UserMessage(input)) => queued.push_back((input, false)),
                             Some(UiCommand::SetPermissionMode(mode)) => permissions.set_mode(mode),
                             Some(UiCommand::SetGoal(_))
@@ -245,13 +280,21 @@ impl<P: Provider> Agent<P> {
                             | Some(UiCommand::Clear) => {}
                             Some(UiCommand::Shutdown) | None => {
                                 cancel.cancel();
-                                let _ = (&mut turn).await;
-                                return;
+                                let result = (&mut turn).await;
+                                shutting_down = true;
+                                break result;
                             }
                         }
                     }
                 }
             };
+
+            if shutting_down {
+                return self.into_state();
+            }
+            if steering {
+                continue;
+            }
 
             let interrupted = matches!(result, Ok(StopReason::Interrupted));
             if interrupted {
@@ -301,6 +344,7 @@ impl<P: Provider> Agent<P> {
 
             match command {
                 Some(UiCommand::UserMessage(input)) => return Some((input, false)),
+                Some(UiCommand::Steer(input)) => return Some((input, true)),
                 Some(UiCommand::SetGoal(Some(objective))) => {
                     self.goal_signal.reset();
                     self.goal = Some(GoalState {
@@ -878,6 +922,42 @@ mod tests {
                 vision: false,
             }
         }
+    }
+
+    #[test]
+    fn state_restores_conversation_into_a_different_agent() {
+        let state = AgentState {
+            transcript: vec![Message {
+                role: Role::User,
+                blocks: vec![ContentBlock::Text {
+                    text: "keep this context".into(),
+                    meta: ProviderMetadata::default(),
+                }],
+                usage: None,
+            }],
+            last_input_tokens: 42,
+        };
+        let agent = Agent::new(
+            LocalCompactingProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            Vec::new(),
+            PermissionEngine::new(Mode::Suggest),
+            ModelConfig {
+                model: "different-model".into(),
+                system: String::new(),
+                max_tokens: 1_024,
+                reasoning_effort: None,
+            },
+            PathBuf::new(),
+        )
+        .with_state(state);
+
+        assert_eq!(agent.last_input_tokens, 42);
+        assert!(matches!(
+            &agent.context.transcript()[0].blocks[0],
+            ContentBlock::Text { text, .. } if text == "keep this context"
+        ));
     }
 
     #[tokio::test]

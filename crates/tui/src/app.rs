@@ -15,12 +15,12 @@ use ratatui::text::Line;
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use tokio_agent_core::agent::{Agent, AgentEvent, UiCommand};
+use tokio_agent_core::agent::{Agent, AgentEvent, AgentState, UiCommand};
 use tokio_agent_core::permission::Mode;
 use tokio_agent_core::provider::Provider;
 
 use crate::projection::{FrontendEffect, FrontendProjection};
-use crate::provider_setup::configure_provider_in;
+use crate::provider_setup::{configure_provider_in, configure_provider_with_terminal};
 use crate::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,12 +29,70 @@ pub enum RunOutcome {
     ConfigureProvider,
 }
 
+pub struct Tui {
+    runtime: tokio::runtime::Runtime,
+    terminal: DefaultTerminal,
+    agent_state: Option<AgentState>,
+    projection: Option<FrontendProjection>,
+}
+
+impl Tui {
+    pub fn new() -> io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        theme::init_terminal_bg(query_terminal_bg());
+        let terminal = ratatui::init();
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnableBracketedPaste,
+            EnableMouseCapture,
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
+        ) {
+            restore_terminal();
+            return Err(error);
+        }
+        Ok(Self {
+            runtime,
+            terminal,
+            agent_state: None,
+            projection: None,
+        })
+    }
+
+    pub fn run<P: Provider + 'static>(&mut self, agent: Agent<P>) -> io::Result<RunOutcome> {
+        run_session(
+            &mut self.terminal,
+            &self.runtime,
+            agent,
+            &mut self.agent_state,
+            &mut self.projection,
+        )
+    }
+
+    pub fn configure_provider(&mut self, cwd: &std::path::Path) -> io::Result<bool> {
+        configure_provider_with_terminal(&mut self.terminal, &self.runtime, cwd)
+    }
+}
+
+impl Drop for Tui {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
 pub fn run<P: Provider + 'static>(agent: Agent<P>) -> io::Result<RunOutcome> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    Tui::new()?.run(agent)
+}
+
+fn run_session<P: Provider + 'static>(
+    terminal: &mut DefaultTerminal,
+    runtime: &tokio::runtime::Runtime,
+    mut agent: Agent<P>,
+    agent_state: &mut Option<AgentState>,
+    saved_projection: &mut Option<FrontendProjection>,
+) -> io::Result<RunOutcome> {
     let handle = runtime.handle().clone();
-    theme::init_terminal_bg(query_terminal_bg());
     let session = SessionDisplay {
         provider: agent.provider_name().to_owned(),
         model: agent.model().to_owned(),
@@ -49,28 +107,37 @@ pub fn run<P: Provider + 'static>(agent: Agent<P>) -> io::Result<RunOutcome> {
         }),
     };
     let cwd = session.cwd.clone();
-    let mut terminal = ratatui::init();
-    let restore = TerminalRestore;
-    execute!(
-        io::stdout(),
-        EnableBracketedPaste,
-        EnableMouseCapture,
-        PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
-    )?;
+    if let Some(state) = agent_state.clone() {
+        agent = agent.with_state(state);
+    }
     let (commands_tx, commands_rx) = unbounded_channel();
     let (events_tx, events_rx) = unbounded_channel();
+    let mut restored_projection = saved_projection.take();
+    if let Some(projection) = &mut restored_projection {
+        projection.update_session(
+            session.provider.clone(),
+            session.model.clone(),
+            session.effort.clone(),
+            display_path(&session.cwd),
+            session.context_window,
+            session.max_output_tokens,
+            session.permission_mode,
+        );
+    }
     let mut agent_task = handle.spawn(agent.run(commands_rx, events_tx));
     let mut app = App::new(commands_tx, events_rx, session);
+    if let Some(projection) = restored_projection {
+        app.projection = projection;
+    }
     let result = loop {
-        match app.event_loop(&mut terminal) {
+        match app.event_loop(terminal) {
             Ok(RunOutcome::ConfigureProvider) => {
                 let mut draw_background = |frame: &mut Frame, height| {
                     app.drain_events();
                     app.spinner = app.spinner.wrapping_add(1);
                     app.draw_with_provider_panel(frame, height)
                 };
-                let changed =
-                    configure_provider_in(&mut terminal, &runtime, &cwd, &mut draw_background)?;
+                let changed = configure_provider_in(terminal, runtime, &cwd, &mut draw_background)?;
                 let during_turn = app.projection.is_running();
                 if changed && app.provider_selection_changed(during_turn) {
                     break Ok(RunOutcome::ConfigureProvider);
@@ -81,7 +148,8 @@ pub fn run<P: Provider + 'static>(agent: Agent<P>) -> io::Result<RunOutcome> {
             result => break result,
         }
     };
-    drop(restore);
+    *saved_projection = Some(app.take_projection());
+    drop(app);
     let (agent_result, forced) = runtime.block_on(async {
         if let Ok(result) = tokio::time::timeout(Duration::from_secs(2), &mut agent_task).await {
             (result, false)
@@ -93,7 +161,10 @@ pub fn run<P: Provider + 'static>(agent: Agent<P>) -> io::Result<RunOutcome> {
     match (result, agent_result) {
         (Err(err), _) => Err(err),
         (Ok(outcome), Err(_)) if forced => Ok(outcome),
-        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(outcome), Ok(state)) => {
+            *agent_state = Some(state);
+            Ok(outcome)
+        }
         (Ok(_), Err(err)) => Err(io::Error::other(format!("agent task failed: {err}"))),
     }
 }
@@ -104,18 +175,14 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
 }
 
-struct TerminalRestore;
-
-impl Drop for TerminalRestore {
-    fn drop(&mut self) {
-        let _ = execute!(
-            io::stdout(),
-            PopKeyboardEnhancementFlags,
-            DisableMouseCapture,
-            DisableBracketedPaste
-        );
-        ratatui::restore();
-    }
+fn restore_terminal() {
+    let _ = execute!(
+        io::stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
+    ratatui::restore();
 }
 
 fn query_terminal_bg() -> Option<(u8, u8, u8)> {
@@ -211,6 +278,22 @@ impl App {
             provider_restart_pending: false,
             provider_restart_ready: false,
         }
+    }
+
+    fn take_projection(&mut self) -> FrontendProjection {
+        std::mem::replace(
+            &mut self.projection,
+            FrontendProjection::new(
+                String::new(),
+                String::new(),
+                None,
+                String::new(),
+                None,
+                0,
+                Mode::Suggest,
+                Vec::new(),
+            ),
+        )
     }
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> io::Result<RunOutcome> {
@@ -319,14 +402,14 @@ impl App {
                         }
                     }
                     UiCommand::SetReasoningEffort(None) => {}
-                    UiCommand::UserMessage(message) => {
+                    UiCommand::UserMessage(message) | UiCommand::Steer(message) => {
                         if let Err(error) = tokio_agent_config::store_recent_message(message) {
                             tracing::warn!(%error, "failed to persist recent message");
                         }
                     }
                     _ => {}
                 }
-                let submission = matches!(command, UiCommand::UserMessage(_));
+                let submission = matches!(command, UiCommand::UserMessage(_) | UiCommand::Steer(_));
                 if self.commands_tx.send(command).is_err() && submission {
                     self.projection.submission_failed();
                 }

@@ -115,19 +115,37 @@ fn run_headless(prompt: String, yolo: bool) -> anyhow::Result<()> {
 
 fn run_tui(yolo: bool) -> anyhow::Result<()> {
     let cwd = headless::cwd();
-    loop {
-        let agent = match session::build_session(&cwd, yolo) {
-            Ok(agent) => agent,
+    let mut agent = loop {
+        match session::build_session(&cwd, yolo) {
+            Ok(agent) => break agent,
             Err(error) => {
                 if tokio_agent_tui::configure_provider(&cwd).context("configuring a provider")? {
                     continue;
                 }
                 return Err(error);
             }
-        };
-        match tokio_agent_tui::run(agent).context("running the terminal UI")? {
+        }
+    };
+    let mut tui = tokio_agent_tui::Tui::new().context("starting the terminal UI")?;
+    loop {
+        match tui.run(agent).context("running the terminal UI")? {
             tokio_agent_tui::RunOutcome::Quit => return Ok(()),
-            tokio_agent_tui::RunOutcome::ConfigureProvider => {}
+            tokio_agent_tui::RunOutcome::ConfigureProvider => {
+                agent = loop {
+                    match session::build_session(&cwd, yolo) {
+                        Ok(agent) => break agent,
+                        Err(error) => {
+                            if tui
+                                .configure_provider(&cwd)
+                                .context("configuring a provider")?
+                            {
+                                continue;
+                            }
+                            return Err(error);
+                        }
+                    }
+                };
+            }
         }
     }
 }

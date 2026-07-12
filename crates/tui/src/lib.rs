@@ -4,5 +4,5 @@ mod projection;
 mod provider_setup;
 mod theme;
 
-pub use app::{RunOutcome, run};
+pub use app::{RunOutcome, Tui, run};
 pub use provider_setup::configure_provider;
