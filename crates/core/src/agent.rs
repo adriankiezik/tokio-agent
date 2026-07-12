@@ -374,9 +374,10 @@ impl<P: Provider> Agent<P> {
                 Some(UiCommand::SetLoop(Some((interval, prompt)))) => {
                     self.loop_schedule = Some(LoopSchedule {
                         interval,
-                        prompt,
+                        prompt: prompt.clone(),
                         next_fire: Instant::now() + interval,
                     });
+                    return Some((prompt, true));
                 }
                 Some(UiCommand::SetLoop(None)) | Some(UiCommand::Interrupt) => {
                     self.loop_schedule = None;
@@ -922,6 +923,41 @@ mod tests {
                 vision: false,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_new_loop_runs_immediately() {
+        let mut agent = Agent::new(
+            LocalCompactingProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            Vec::new(),
+            PermissionEngine::new(Mode::Suggest),
+            ModelConfig {
+                model: "model".into(),
+                system: String::new(),
+                max_tokens: 1_024,
+                reasoning_effort: None,
+            },
+            PathBuf::new(),
+        );
+        let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        commands
+            .send(UiCommand::SetLoop(Some((
+                Duration::from_secs(10),
+                "check now".into(),
+            ))))
+            .expect("agent command channel");
+
+        let input = agent
+            .next_idle_input(&mut receiver)
+            .await
+            .expect("immediate loop input");
+
+        assert_eq!(input, ("check now".to_owned(), true));
+        let schedule = agent.loop_schedule.expect("active loop schedule");
+        assert_eq!(schedule.interval, Duration::from_secs(10));
+        assert_eq!(schedule.prompt, "check now");
     }
 
     #[test]

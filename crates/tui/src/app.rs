@@ -484,6 +484,7 @@ impl App {
             picker_area,
             provider_notice_area,
             provider_area,
+            command_feedback_area,
             interaction_area,
             _footer_spacing,
             footer_area,
@@ -497,6 +498,7 @@ impl App {
             Constraint::Length(self.projection.slash_picker_height()),
             Constraint::Length(self.projection.provider_change_notice_height()),
             Constraint::Length(provider_height),
+            Constraint::Length(self.projection.command_feedback_height()),
             Constraint::Length(self.projection.composer_height(frame.area().width)),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -513,6 +515,8 @@ impl App {
         self.projection.render_slash_picker(frame, picker_area);
         self.projection
             .render_provider_change_notice(frame, provider_notice_area);
+        self.projection
+            .render_command_feedback(frame, command_feedback_area);
         self.projection.render_interaction(frame, interaction_area);
         self.projection.render_footer(frame, footer_area);
         self.selection_area = frame.area();

@@ -111,11 +111,6 @@ impl Composer {
         self.cursor = self.buffer.len();
     }
 
-    pub(super) fn take(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.buffer)
-    }
-
     pub(super) fn height(&self, total_width: u16) -> u16 {
         let inner = total_width
             .saturating_sub(PROMPT_COLS + RIGHT_MARGIN)

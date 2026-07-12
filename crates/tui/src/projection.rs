@@ -106,6 +106,7 @@ const PERMISSION_MODES: [PermissionModeOption; 3] = [
 ];
 
 const QUIT_CONFIRMATION: Duration = Duration::from_secs(3);
+const COMMAND_NOTICE_DURATION: Duration = Duration::from_secs(3);
 
 struct Pending {
     id: PermissionId,
@@ -146,6 +147,8 @@ pub(crate) struct FrontendProjection {
     context_usage_known: bool,
     quit_armed_until: Option<Instant>,
     scroll_button_area: Option<Rect>,
+    command_error: Option<String>,
+    command_notice: Option<(String, Instant)>,
 }
 
 impl FrontendProjection {
@@ -187,6 +190,8 @@ impl FrontendProjection {
             context_usage_known: true,
             quit_armed_until: None,
             scroll_button_area: None,
+            command_error: None,
+            command_notice: None,
         }
     }
 
@@ -217,9 +222,12 @@ impl FrontendProjection {
         self.elapsed = Duration::ZERO;
         self.last_request_usage = Usage::default();
         self.context_usage_known = self.transcript.len() == 0;
+        self.command_error = None;
+        self.command_notice = None;
     }
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> FrontendEffect {
+        self.command_error = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if self.provider_change_notice {
             if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
@@ -254,6 +262,7 @@ impl FrontendProjection {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         self.quit_armed_until = None;
         self.permissions_selected = None;
+        self.command_error = None;
         self.composer.insert_str(&normalized);
         self.leave_history();
         self.slash_selected = 0;
@@ -584,6 +593,26 @@ impl FrontendProjection {
             .collect()
     }
 
+    fn slash_display_matches(&self) -> Vec<SlashCommand> {
+        if !self.composer.text().starts_with('/') {
+            return Vec::new();
+        }
+
+        let matches = self.slash_matches();
+        if !matches.is_empty() || self.slash_picker_open() {
+            return matches;
+        }
+
+        SLASH_COMMANDS
+            .iter()
+            .copied()
+            .filter(|command| {
+                matches!(command.action, SlashAction::Goal | SlashAction::Loop)
+                    && command_usage_visible(command.name, self.composer.text())
+            })
+            .collect()
+    }
+
     fn selected_slash_command(&self) -> Option<SlashCommand> {
         let matches = self.slash_matches();
         matches
@@ -640,32 +669,46 @@ impl FrontendProjection {
     }
 
     fn submit(&mut self) -> FrontendEffect {
-        let text = self.composer.take();
+        let text = self.composer.text().to_owned();
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            self.composer.clear();
             return FrontendEffect::None;
         }
         let message = trimmed.to_owned();
-        if let Some(command) = parse_autonomy_command(&message) {
-            self.transcript.push_user(message.clone());
-            self.scroll_up = 0;
-            if self.history.last() != Some(&message) {
-                self.history.push(message);
+        match parse_autonomy_command(&message) {
+            AutonomyCommandParse::Valid(command) => {
+                self.command_notice = command_notice(&command)
+                    .map(|message| (message.to_owned(), Instant::now() + COMMAND_NOTICE_DURATION));
+                self.composer.clear();
+                self.transcript.push_user(message.clone());
+                self.scroll_up = 0;
+                if self.history.last() != Some(&message) {
+                    self.history.push(message);
+                }
+                self.leave_history();
+                FrontendEffect::Command(command)
             }
-            self.leave_history();
-            return FrontendEffect::Command(command);
-        }
-        if self.history.last() != Some(&message) {
-            self.history.push(message.clone());
-        }
-        self.leave_history();
-        if self.running {
-            self.transcript.push_user(message.clone());
-            self.scroll_up = 0;
-            FrontendEffect::Command(UiCommand::Steer(message))
-        } else {
-            self.begin_turn(&message);
-            FrontendEffect::Command(UiCommand::UserMessage(message))
+            AutonomyCommandParse::Invalid(error) => {
+                self.command_notice = None;
+                self.command_error = Some(error);
+                FrontendEffect::None
+            }
+            AutonomyCommandParse::NotACommand => {
+                self.composer.clear();
+                if self.history.last() != Some(&message) {
+                    self.history.push(message.clone());
+                }
+                self.leave_history();
+                if self.running {
+                    self.transcript.push_user(message.clone());
+                    self.scroll_up = 0;
+                    FrontendEffect::Command(UiCommand::Steer(message))
+                } else {
+                    self.begin_turn(&message);
+                    FrontendEffect::Command(UiCommand::UserMessage(message))
+                }
+            }
         }
     }
 
@@ -676,15 +719,49 @@ impl FrontendProjection {
         }
     }
 
+    fn active_command_notice(&self) -> Option<&str> {
+        self.command_notice
+            .as_ref()
+            .filter(|(_, expires_at)| *expires_at > Instant::now())
+            .map(|(message, _)| message.as_str())
+    }
+
+    pub(crate) fn command_feedback_height(&self) -> u16 {
+        if (self.command_error.is_some() || self.active_command_notice().is_some())
+            && self.pending.is_none()
+        {
+            2
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn render_command_feedback(&self, frame: &mut Frame, area: Rect) {
+        let feedback = self
+            .command_error
+            .as_deref()
+            .map(|error| (error, theme::error()))
+            .or_else(|| {
+                self.active_command_notice()
+                    .map(|notice| (notice, theme::success()))
+            });
+        if let Some((message, style)) = feedback {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![Span::raw("  "), Span::raw(message)])).style(style),
+                area,
+            );
+        }
+    }
+
     pub(crate) fn working_indicator_height(&self) -> u16 {
         u16::from(self.running && self.pending.is_none())
     }
 
     pub(crate) fn slash_picker_height(&self) -> u16 {
-        if self.pending.is_some() || !self.slash_picker_open() {
+        if self.pending.is_some() {
             return 0;
         }
-        let count = u16::try_from(self.slash_matches().len()).unwrap_or(u16::MAX);
+        let count = u16::try_from(self.slash_display_matches().len()).unwrap_or(u16::MAX);
         if count == 0 { 0 } else { count + 2 }
     }
 
@@ -694,8 +771,9 @@ impl FrontendProjection {
         }
         frame.render_widget(Block::default().style(theme::picker_bg()), area);
         let name_width = slash_command_name_width();
-        let lines = self
-            .slash_matches()
+        let matches = self.slash_display_matches();
+        let query = self.composer.text();
+        let lines = matches
             .into_iter()
             .enumerate()
             .map(|(index, command)| {
@@ -716,7 +794,13 @@ impl FrontendProjection {
                         command_style,
                     ),
                     Span::raw("  "),
-                    Span::styled(command.description, theme::picker_muted()),
+                    Span::styled(
+                        slash_command_description(
+                            command,
+                            command_usage_visible(command.name, query),
+                        ),
+                        theme::picker_muted(),
+                    ),
                 ])
             })
             .collect::<Vec<_>>();
@@ -1062,18 +1146,59 @@ impl FrontendProjection {
     }
 }
 
-fn parse_autonomy_command(input: &str) -> Option<UiCommand> {
+fn command_usage_visible(command_name: &str, input: &str) -> bool {
+    input == command_name
+        || input
+            .strip_prefix(command_name)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+}
+
+fn slash_command_description(command: SlashCommand, fully_typed: bool) -> &'static str {
+    if fully_typed {
+        match command.action {
+            SlashAction::Goal => "Usage: /goal <objective> (or pause, resume, cancel)",
+            SlashAction::Loop => "Usage: /loop <10s|5m|2h> <prompt> (or cancel)",
+            _ => command.description,
+        }
+    } else {
+        command.description
+    }
+}
+
+enum AutonomyCommandParse {
+    NotACommand,
+    Valid(UiCommand),
+    Invalid(String),
+}
+
+fn command_notice(command: &UiCommand) -> Option<&'static str> {
+    match command {
+        UiCommand::SetGoal(Some(_)) => Some("Goal started"),
+        UiCommand::SetGoal(None) => Some("Goal cancelled"),
+        UiCommand::PauseGoal => Some("Goal paused"),
+        UiCommand::ResumeGoal => Some("Goal resumed"),
+        UiCommand::SetLoop(Some(_)) => Some("Loop started"),
+        UiCommand::SetLoop(None) => Some("Loop cancelled"),
+        _ => None,
+    }
+}
+
+fn parse_autonomy_command(input: &str) -> AutonomyCommandParse {
     if let Some(rest) = input
         .strip_prefix("/goal")
         .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
     {
         let argument = rest.trim();
         return match argument {
-            "" => None,
-            "clear" | "cancel" => Some(UiCommand::SetGoal(None)),
-            "pause" => Some(UiCommand::PauseGoal),
-            "resume" => Some(UiCommand::ResumeGoal),
-            objective => Some(UiCommand::SetGoal(Some(objective.to_owned()))),
+            "" => AutonomyCommandParse::Invalid(
+                "Enter an objective · example: /goal finish the migration".to_owned(),
+            ),
+            "clear" | "cancel" => AutonomyCommandParse::Valid(UiCommand::SetGoal(None)),
+            "pause" => AutonomyCommandParse::Valid(UiCommand::PauseGoal),
+            "resume" => AutonomyCommandParse::Valid(UiCommand::ResumeGoal),
+            objective => {
+                AutonomyCommandParse::Valid(UiCommand::SetGoal(Some(objective.to_owned())))
+            }
         };
     }
     if let Some(rest) = input
@@ -1081,31 +1206,67 @@ fn parse_autonomy_command(input: &str) -> Option<UiCommand> {
         .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
     {
         let argument = rest.trim();
-        if matches!(argument, "cancel" | "clear" | "stop") {
-            return Some(UiCommand::SetLoop(None));
+        if argument.is_empty() {
+            return AutonomyCommandParse::Invalid(
+                "Enter an interval and prompt · example: /loop 5m check the deploy".to_owned(),
+            );
         }
-        let (interval, prompt) = argument.split_once(char::is_whitespace)?;
-        let interval = parse_loop_duration(interval)?;
+        if matches!(argument, "cancel" | "clear" | "stop") {
+            return AutonomyCommandParse::Valid(UiCommand::SetLoop(None));
+        }
+
+        let Some((interval, prompt)) = argument.split_once(char::is_whitespace) else {
+            return match parse_loop_duration(argument) {
+                Ok(_) => AutonomyCommandParse::Invalid(
+                    "Enter a prompt to run after the interval · example: /loop 5m check the deploy"
+                        .to_owned(),
+                ),
+                Err(error) => AutonomyCommandParse::Invalid(error.to_owned()),
+            };
+        };
+        if matches!(interval, "cancel" | "clear" | "stop") {
+            return AutonomyCommandParse::Invalid(format!(
+                "`/loop {interval}` does not accept additional arguments"
+            ));
+        }
+        let interval = match parse_loop_duration(interval) {
+            Ok(interval) => interval,
+            Err(error) => return AutonomyCommandParse::Invalid(error.to_owned()),
+        };
         let prompt = prompt.trim();
         if prompt.is_empty() {
-            return None;
+            return AutonomyCommandParse::Invalid(
+                "Enter a prompt to run after the interval · example: /loop 5m check the deploy"
+                    .to_owned(),
+            );
         }
-        return Some(UiCommand::SetLoop(Some((interval, prompt.to_owned()))));
+        return AutonomyCommandParse::Valid(UiCommand::SetLoop(Some((
+            interval,
+            prompt.to_owned(),
+        ))));
     }
-    None
+    AutonomyCommandParse::NotACommand
 }
 
-fn parse_loop_duration(input: &str) -> Option<Duration> {
-    let split = input.find(|character: char| !character.is_ascii_digit())?;
+fn parse_loop_duration(input: &str) -> Result<Duration, &'static str> {
+    let split = input
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or("Invalid interval · use a whole number such as 30s, 5m, or 2h")?;
     let (amount, unit) = input.split_at(split);
-    let amount = amount.parse::<u64>().ok()?;
+    let amount = amount
+        .parse::<u64>()
+        .map_err(|_| "Invalid interval · use a whole number such as 30s, 5m, or 2h")?;
     let seconds = match unit {
-        "s" => amount,
-        "m" => amount.checked_mul(60)?,
-        "h" => amount.checked_mul(60 * 60)?,
-        _ => return None,
-    };
-    (seconds >= 10).then(|| Duration::from_secs(seconds))
+        "s" => amount.checked_mul(1),
+        "m" => amount.checked_mul(60),
+        "h" => amount.checked_mul(60 * 60),
+        _ => return Err("Invalid interval · use seconds, minutes, or hours: 30s, 5m, or 2h"),
+    }
+    .ok_or("Interval is too large")?;
+    if seconds < 10 {
+        return Err("Minimum loop interval is 10 seconds");
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
@@ -1790,25 +1951,150 @@ mod tests {
     }
 
     #[test]
+    fn autonomy_command_descriptions_show_usage_only_when_fully_typed() {
+        let goal = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/goal")
+            .copied()
+            .expect("goal command");
+        let loop_command = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/loop")
+            .copied()
+            .expect("loop command");
+
+        assert_eq!(
+            slash_command_description(goal, false),
+            "Keep working autonomously until an objective is complete"
+        );
+        assert_eq!(
+            slash_command_description(loop_command, false),
+            "Run a prompt repeatedly on an interval"
+        );
+        assert_eq!(
+            slash_command_description(goal, true),
+            "Usage: /goal <objective> (or pause, resume, cancel)"
+        );
+        assert_eq!(
+            slash_command_description(loop_command, true),
+            "Usage: /loop <10s|5m|2h> <prompt> (or cancel)"
+        );
+    }
+
+    #[test]
+    fn slash_palette_is_hidden_for_an_empty_composer() {
+        let projection = projection();
+
+        assert!(projection.slash_display_matches().is_empty());
+        assert_eq!(projection.slash_picker_height(), 0);
+    }
+
+    #[test]
+    fn autonomy_usage_stays_visible_while_typing_arguments() {
+        let mut projection = projection();
+
+        projection.composer.replace("/loop 5m check the deploy");
+        assert!(!projection.slash_picker_open());
+        assert_eq!(projection.slash_picker_height(), 3);
+        assert!(matches!(
+            projection.slash_display_matches().as_slice(),
+            [command] if command.name == "/loop"
+        ));
+        assert!(command_usage_visible("/loop", projection.composer.text()));
+
+        projection.composer.replace("/goal finish the migration");
+        assert_eq!(projection.slash_picker_height(), 3);
+        assert!(matches!(
+            projection.slash_display_matches().as_slice(),
+            [command] if command.name == "/goal"
+        ));
+    }
+
+    #[test]
     fn autonomy_commands_parse_goal_and_loop_controls() {
         assert!(matches!(
             parse_autonomy_command("/goal finish the migration"),
-            Some(UiCommand::SetGoal(Some(objective))) if objective == "finish the migration"
+            AutonomyCommandParse::Valid(UiCommand::SetGoal(Some(objective)))
+                if objective == "finish the migration"
         ));
         assert!(matches!(
             parse_autonomy_command("/goal pause"),
-            Some(UiCommand::PauseGoal)
+            AutonomyCommandParse::Valid(UiCommand::PauseGoal)
         ));
         assert!(matches!(
             parse_autonomy_command("/loop 5m check the deploy"),
-            Some(UiCommand::SetLoop(Some((interval, prompt))))
+            AutonomyCommandParse::Valid(UiCommand::SetLoop(Some((interval, prompt))))
                 if interval == Duration::from_secs(300) && prompt == "check the deploy"
         ));
         assert!(matches!(
             parse_autonomy_command("/loop cancel"),
-            Some(UiCommand::SetLoop(None))
+            AutonomyCommandParse::Valid(UiCommand::SetLoop(None))
         ));
-        assert!(parse_autonomy_command("/loop 2s too fast").is_none());
+    }
+
+    #[test]
+    fn malformed_autonomy_commands_return_specific_errors() {
+        for (input, expected) in [
+            ("/goal", "Enter an objective"),
+            ("/loop", "Enter an interval and prompt"),
+            ("/loop .", "Invalid interval"),
+            ("/loop 5m", "Enter a prompt"),
+            ("/loop 2s too fast", "Minimum loop interval is 10 seconds"),
+            ("/loop cancel extra", "does not accept additional arguments"),
+        ] {
+            let AutonomyCommandParse::Invalid(error) = parse_autonomy_command(input) else {
+                panic!("expected invalid command for {input}");
+            };
+            assert!(
+                error.contains(expected),
+                "{error:?} did not contain {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_autonomy_command_stays_in_composer() {
+        let mut projection = projection();
+        projection.composer.replace("/loop .");
+
+        assert!(matches!(projection.submit(), FrontendEffect::None));
+        assert_eq!(projection.composer.text(), "/loop .");
+        assert!(
+            projection
+                .command_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Invalid interval"))
+        );
+        assert_eq!(projection.command_feedback_height(), 2);
+        assert!(projection.history.is_empty());
+        assert_eq!(projection.transcript.len(), 0);
+    }
+
+    #[test]
+    fn goal_and_loop_commands_show_temporary_success_notices() {
+        for (input, expected) in [
+            ("/goal finish the migration", "Goal started"),
+            ("/goal cancel", "Goal cancelled"),
+            ("/goal pause", "Goal paused"),
+            ("/goal resume", "Goal resumed"),
+            ("/loop 10s check the deploy", "Loop started"),
+            ("/loop cancel", "Loop cancelled"),
+        ] {
+            let mut projection = projection();
+            projection.composer.replace(input);
+
+            assert!(matches!(projection.submit(), FrontendEffect::Command(_)));
+            assert_eq!(projection.active_command_notice(), Some(expected));
+            assert_eq!(projection.command_feedback_height(), 2);
+
+            projection
+                .command_notice
+                .as_mut()
+                .expect("command notice")
+                .1 = Instant::now();
+            assert_eq!(projection.active_command_notice(), None);
+            assert_eq!(projection.command_feedback_height(), 0);
+        }
     }
 
     #[test]
