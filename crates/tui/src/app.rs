@@ -16,7 +16,6 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use tokio_agent_core::agent::{Agent, AgentEvent, AgentState, UiCommand};
-use tokio_agent_core::permission::Mode;
 use tokio_agent_core::provider::Provider;
 use tokio_agent_extension_api::{CommandDescriptor, ExtensionSummary};
 
@@ -102,7 +101,6 @@ fn run_session<P: Provider + 'static>(
         cwd: agent.cwd().to_path_buf(),
         context_window: agent.context_before_compaction(),
         max_output_tokens: agent.max_output_tokens(),
-        permission_mode: agent.permission_mode(),
         commands: agent.command_catalog(),
         extensions: agent.extension_catalog(),
         history: tokio_agent_config::recent_messages().unwrap_or_else(|error| {
@@ -125,7 +123,6 @@ fn run_session<P: Provider + 'static>(
             display_path(&session.cwd),
             session.context_window,
             session.max_output_tokens,
-            session.permission_mode,
             session.commands.clone(),
             session.extensions.clone(),
         );
@@ -245,7 +242,6 @@ struct SessionDisplay {
     cwd: std::path::PathBuf,
     context_window: Option<u64>,
     max_output_tokens: u32,
-    permission_mode: Mode,
     history: Vec<String>,
     commands: Vec<CommandDescriptor>,
     extensions: Vec<ExtensionSummary>,
@@ -260,7 +256,6 @@ impl Default for SessionDisplay {
             cwd: std::path::PathBuf::new(),
             context_window: None,
             max_output_tokens: 0,
-            permission_mode: Mode::Suggest,
             history: Vec::new(),
             commands: Vec::new(),
             extensions: Vec::new(),
@@ -301,7 +296,6 @@ impl App {
                 display_path(&session.cwd),
                 session.context_window,
                 session.max_output_tokens,
-                session.permission_mode,
                 session.history,
                 session.commands,
                 session.extensions,
@@ -330,7 +324,6 @@ impl App {
                 String::new(),
                 None,
                 0,
-                Mode::Suggest,
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -458,16 +451,6 @@ impl App {
             }
             FrontendEffect::Command(command) => {
                 match &command {
-                    UiCommand::SetPermissionMode(mode) => {
-                        let mode = match mode {
-                            Mode::Suggest => tokio_agent_config::PermissionMode::Suggest,
-                            Mode::AutoEdit => tokio_agent_config::PermissionMode::AutoEdit,
-                            Mode::FullAuto => tokio_agent_config::PermissionMode::FullAuto,
-                        };
-                        if let Err(error) = tokio_agent_config::store_permission_mode(mode) {
-                            tracing::warn!(%error, "failed to persist permission mode");
-                        }
-                    }
                     UiCommand::SetModel(model) => {
                         if let Err(error) = tokio_agent_config::store_model_selection(model) {
                             tracing::warn!(%error, "failed to persist model selection");
@@ -562,7 +545,7 @@ impl App {
             scroll_button_area,
             working_area,
             _working_spacing,
-            permissions_area,
+            settings_area,
             command_feedback_area,
             picker_area,
             extensions_area,
@@ -577,7 +560,7 @@ impl App {
             Constraint::Length(self.projection.scroll_button_height()),
             Constraint::Length(self.projection.working_indicator_height()),
             Constraint::Length(self.projection.working_indicator_height()),
-            Constraint::Length(self.projection.permissions_panel_height()),
+            Constraint::Length(self.projection.settings_panel_height()),
             Constraint::Length(self.projection.command_feedback_height()),
             Constraint::Length(self.projection.slash_picker_height()),
             Constraint::Length(self.projection.extension_manager_height()),
@@ -594,8 +577,7 @@ impl App {
             .render_scroll_button(frame, scroll_button_area);
         self.projection
             .render_working_indicator(frame, working_area);
-        self.projection
-            .render_permissions_panel(frame, permissions_area);
+        self.projection.render_settings_panel(frame, settings_area);
         self.projection
             .render_command_feedback(frame, command_feedback_area);
         self.projection.render_slash_picker(frame, picker_area);

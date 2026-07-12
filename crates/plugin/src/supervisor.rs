@@ -54,6 +54,10 @@ pub enum ActionError {
     StatusRateLimit,
     #[error("another extension owns autonomous work")]
     AutonomyConflict,
+    #[error("extension action used a stale generation or wrong owner")]
+    StaleGeneration,
+    #[error("invalid or unsafe interaction content")]
+    InvalidInteraction,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +72,8 @@ pub enum ActionOutcome {
     TimerScheduled { id: TimerId, after: Duration },
     TimerCancelled(TimerId),
     StatePersisted,
+    UserStatePersisted,
+    InteractionRequested(tokio_agent_extension_api::InteractionRequest),
     AutonomyReleased,
 }
 
@@ -341,6 +347,75 @@ fn apply_action(
                 return Err(ActionError::PayloadLimit);
             }
             Ok(ActionOutcome::StatePersisted)
+        }
+        ExtensionAction::PersistUserState(bytes) => {
+            require(state, Capability::StorageUser)?;
+            if bytes.len() > policy.maximum_payload_bytes {
+                return Err(ActionError::PayloadLimit);
+            }
+            Ok(ActionOutcome::UserStatePersisted)
+        }
+        ExtensionAction::RequestInteraction(request) => {
+            require(state, Capability::InteractionRequest)?;
+            if request.owner != *owner || request.generation != state.generation {
+                return Err(ActionError::StaleGeneration);
+            }
+            let encoded = serde_json::to_vec(&request).map_err(|_| ActionError::PayloadLimit)?;
+            if encoded.len() > policy.maximum_payload_bytes {
+                return Err(ActionError::PayloadLimit);
+            }
+            if !safe_interaction(&request) {
+                return Err(ActionError::InvalidInteraction);
+            }
+            Ok(ActionOutcome::InteractionRequested(request))
+        }
+    }
+}
+
+fn safe_interaction(request: &tokio_agent_extension_api::InteractionRequest) -> bool {
+    fn text(value: &str) -> bool {
+        value.chars().count() <= 4_096
+            && !value.chars().any(|character| {
+                character == '\u{1b}'
+                    || (character.is_control() && !matches!(character, '\n' | '\t'))
+            })
+    }
+    fn id(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':' | b'.')
+            })
+    }
+    if !id(request.id.as_str()) {
+        return false;
+    }
+    match &request.spec {
+        tokio_agent_extension_api::InteractionSpec::Approval(spec) => {
+            text(&spec.title)
+                && spec.body.len() <= 32
+                && spec.body.iter().all(|section| {
+                    section.heading.as_deref().is_none_or(text) && text(&section.text)
+                })
+                && !spec.actions.is_empty()
+                && spec.actions.len() <= 16
+                && spec.actions.iter().all(|action| {
+                    id(&action.id)
+                        && text(&action.label)
+                        && action.key_hint.as_deref().is_none_or(text)
+                })
+                && spec.copy_text.as_deref().is_none_or(text)
+        }
+        tokio_agent_extension_api::InteractionSpec::SingleSelect(spec) => {
+            text(&spec.title)
+                && !spec.options.is_empty()
+                && spec.options.len() <= 64
+                && spec.options.iter().all(|option| {
+                    id(&option.id)
+                        && text(&option.label)
+                        && option.description.as_deref().is_none_or(text)
+                })
+                && spec.selected.as_deref().is_none_or(id)
         }
     }
 }

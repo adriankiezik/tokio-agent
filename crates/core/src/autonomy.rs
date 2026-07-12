@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use serde_json::Value;
 
 use crate::provider::BoxFuture;
-use crate::tool::{Action, PermissionRequest, Tool, ToolCtx, ToolDef, ToolResult};
+use crate::tool::{Tool, ToolCtx, ToolDef, ToolEffect, ToolResult};
 
 pub(crate) const UPDATE_GOAL_TOOL: &str = "update_goal";
 
@@ -65,12 +65,10 @@ impl Tool for UpdateGoalTool {
         }
     }
 
-    fn permission(&self, _input: &Value) -> PermissionRequest {
-        PermissionRequest {
-            tool: UPDATE_GOAL_TOOL.to_owned(),
-            summary: "update autonomous goal status".to_owned(),
-            action: Action::Read,
-        }
+    fn effect(&self) -> ToolEffect { ToolEffect::Read }
+
+    fn summary(&self, _input: &Value) -> Option<String> {
+        Some("update autonomous goal status".to_owned())
     }
 
     fn run<'a>(&'a self, input: Value, _ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {

@@ -13,9 +13,11 @@ use tokio_util::sync::CancellationToken;
 use crate::context::ContextAssembler;
 use crate::event::{Event, StopReason};
 use crate::message::{ContentBlock, Message, ProviderMetadata, Role, ToolOutput, Usage};
-use crate::permission::{Decision, Mode, PermissionEngine, PermissionId};
 use crate::provider::{Provider, ProviderError, Request};
-use crate::tool::{PermissionRequest, Tool, ToolResult};
+use crate::tool::{
+    FrontendCapabilities, InteractionBroker, InteractionRequest, InteractionResponse, Tool,
+    ToolGate, ToolGateSlot, ToolResult,
+};
 use crate::tool_execution::{DynamicToolCatalog, ToolCallExecutor};
 
 #[derive(Debug)]
@@ -39,9 +41,9 @@ pub enum AgentEvent {
     },
     TurnUsage(Usage),
     RequestUsage(Usage),
-    PermissionNeeded {
-        id: PermissionId,
-        request: PermissionRequest,
+    InteractionRequested(InteractionRequest),
+    InteractionCancelled {
+        id: tokio_agent_extension_api::InteractionId,
     },
     StatusSegments(Vec<StatusSegment>),
     CommandCatalog(Vec<CommandDescriptor>),
@@ -53,25 +55,15 @@ pub enum AgentEvent {
 #[derive(Debug)]
 pub enum UiCommand {
     UserMessage(String),
-    AutomaticMessage {
-        source: ExtensionId,
-        text: String,
-    },
+    AutomaticMessage { source: ExtensionId, text: String },
     Steer(String),
-    InvokeCommand {
-        id: CommandId,
-        arguments: String,
-    },
+    InvokeCommand { id: CommandId, arguments: String },
     CommandHandled(Option<String>),
     Clear,
-    SetPermissionMode(Mode),
     SetModel(String),
     SetReasoningEffort(Option<String>),
     Interrupt,
-    Approve {
-        id: PermissionId,
-        decision: Decision,
-    },
+    RespondToInteraction(InteractionResponse),
     Shutdown,
 }
 
@@ -112,7 +104,8 @@ impl AgentState {
 pub struct Agent<P: Provider> {
     provider: P,
     tools: ToolCallExecutor,
-    permissions: PermissionEngine,
+    interactions: InteractionBroker,
+    gate: ToolGateSlot,
     context: ContextAssembler,
     reasoning_effort_supported: bool,
     provider_name: String,
@@ -122,6 +115,7 @@ pub struct Agent<P: Provider> {
     compaction_available: bool,
     command_catalog: Vec<CommandDescriptor>,
     command_router: Option<Arc<CommandRouteFn>>,
+    interaction_responder: Option<Arc<InteractionResponseFn>>,
     extension_catalog: Vec<ExtensionSummary>,
     session_hook: Option<Arc<SessionHookFn>>,
     session_poll: Option<Arc<dyn Fn() -> Vec<SessionHookEffect> + Send + Sync>>,
@@ -138,10 +132,13 @@ pub enum SessionHookEffect {
     StatusSegments(Vec<StatusSegment>),
     CommandCatalog(Vec<CommandDescriptor>),
     ExtensionCatalog(Vec<ExtensionSummary>),
+    InteractionRequested(InteractionRequest),
+    InteractionCancelled(tokio_agent_extension_api::InteractionId),
     Notice(String),
 }
 
 type CommandRouteFn = dyn Fn(CommandId, String) -> Result<UiCommand, String> + Send + Sync;
+type InteractionResponseFn = dyn Fn(InteractionResponse) -> Result<(), String> + Send + Sync;
 type SessionHookFn =
     dyn Fn(tokio_agent_extension_api::SessionEvent) -> Vec<SessionHookEffect> + Send + Sync;
 
@@ -149,7 +146,7 @@ impl<P: Provider> Agent<P> {
     pub fn new(
         provider: P,
         tools: Vec<Arc<dyn Tool>>,
-        gate: PermissionEngine,
+        gate: Option<Arc<dyn ToolGate>>,
         model: ModelConfig,
         cwd: PathBuf,
     ) -> Self {
@@ -159,10 +156,19 @@ impl<P: Provider> Agent<P> {
             max_tokens,
             reasoning_effort,
         } = model;
+        let interactions = InteractionBroker::default();
+        let gate = ToolGateSlot::new(gate);
         Self {
             provider,
-            tools: ToolCallExecutor::new(tools, cwd.clone()),
-            permissions: gate,
+            tools: ToolCallExecutor::new(
+                tools,
+                cwd.clone(),
+                gate.clone(),
+                interactions.clone(),
+                FrontendCapabilities::default(),
+            ),
+            interactions,
+            gate,
             context: ContextAssembler::new(model, system, max_tokens)
                 .with_reasoning_effort(reasoning_effort),
             reasoning_effort_supported: true,
@@ -173,6 +179,7 @@ impl<P: Provider> Agent<P> {
             compaction_available: true,
             command_catalog: Vec::new(),
             command_router: None,
+            interaction_responder: None,
             extension_catalog: Vec::new(),
             session_hook: None,
             session_poll: None,
@@ -187,6 +194,15 @@ impl<P: Provider> Agent<P> {
     {
         self.command_catalog = catalog;
         self.command_router = Some(Arc::new(router));
+        self
+    }
+
+    #[must_use]
+    pub fn with_interaction_responder<F>(mut self, responder: F) -> Self
+    where
+        F: Fn(InteractionResponse) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.interaction_responder = Some(Arc::new(responder));
         self
     }
 
@@ -249,6 +265,12 @@ impl<P: Provider> Agent<P> {
     }
 
     #[must_use]
+    pub fn with_frontend_capabilities(mut self, capabilities: FrontendCapabilities) -> Self {
+        self.tools.set_frontend_capabilities(capabilities);
+        self
+    }
+
+    #[must_use]
     pub fn with_reasoning_effort_support(mut self, supported: bool) -> Self {
         self.reasoning_effort_supported = supported;
         self
@@ -306,11 +328,12 @@ impl<P: Provider> Agent<P> {
 
     pub fn context_before_compaction(&self) -> Option<u64> {
         self.context_window.map(|window| {
-            if self.provider.supports_native_compaction() {
-                window.saturating_mul(9) / 10
-            } else {
-                window.saturating_sub(u64::from(self.context.max_tokens()).min(20_000))
-            }
+            compaction_threshold(
+                &self.provider_name,
+                self.provider.supports_native_compaction(),
+                window,
+                self.context.max_tokens(),
+            )
         })
     }
 
@@ -318,8 +341,9 @@ impl<P: Provider> Agent<P> {
         self.context.max_tokens()
     }
 
-    pub fn permission_mode(&self) -> Mode {
-        self.permissions.mode()
+    #[must_use]
+    pub fn tool_gate_slot(&self) -> ToolGateSlot {
+        self.gate.clone()
     }
 
     pub async fn run(
@@ -372,7 +396,8 @@ impl<P: Provider> Agent<P> {
             }
 
             let cancel = CancellationToken::new();
-            let permissions = self.permissions.clone();
+            let interactions = self.interactions.clone();
+            let interaction_responder = self.interaction_responder.clone();
             let command_router = self.command_router.clone();
             let mut steering = false;
             let mut shutting_down = false;
@@ -384,7 +409,11 @@ impl<P: Provider> Agent<P> {
                         result = &mut turn => break result,
                         command = commands.recv() => match command {
                             Some(UiCommand::Interrupt) => cancel.cancel(),
-                            Some(UiCommand::Approve { id, decision }) => permissions.resolve(id, decision),
+                            Some(UiCommand::RespondToInteraction(response)) => {
+                                if !interactions.respond(response.clone()) {
+                                    if let Some(responder) = &interaction_responder { let _ = responder(response); }
+                                }
+                            }
                             Some(UiCommand::Steer(input)) => {
                                 queued.push_back((input, false, None));
                                 steering = true;
@@ -407,14 +436,13 @@ impl<P: Provider> Agent<P> {
                                         queued.push_back((text, true, Some(source)));
                                     }
                                     Ok(UiCommand::Interrupt) => cancel.cancel(),
-                                    Ok(UiCommand::Approve { id, decision }) => {
-                                        permissions.resolve(id, decision);
+                                    Ok(UiCommand::RespondToInteraction(response)) => {
+                                        if !interactions.respond(response.clone()) {
+                                            if let Some(responder) = &interaction_responder { let _ = responder(response); }
+                                        }
                                     }
                                     Ok(UiCommand::CommandHandled(message)) => {
                                         let _ = events.send(AgentEvent::CommandHandled(Ok(message)));
-                                    }
-                                    Ok(UiCommand::SetPermissionMode(mode)) => {
-                                        permissions.set_mode(mode);
                                     }
                                     Ok(UiCommand::InvokeCommand { .. })
                                     | Ok(UiCommand::SetModel(_))
@@ -430,7 +458,6 @@ impl<P: Provider> Agent<P> {
                             Some(UiCommand::CommandHandled(message)) => {
                                 let _ = events.send(AgentEvent::CommandHandled(Ok(message)));
                             }
-                            Some(UiCommand::SetPermissionMode(mode)) => permissions.set_mode(mode),
                             Some(UiCommand::SetModel(_))
                             | Some(UiCommand::SetReasoningEffort(_))
                             | Some(UiCommand::Clear) => {}
@@ -543,7 +570,6 @@ impl<P: Provider> Agent<P> {
                         self.context.clear();
                         let _ = events.send(AgentEvent::CommandHandled(Ok(None)));
                     }
-                    Some(UiCommand::SetPermissionMode(mode)) => self.permissions.set_mode(mode),
                     Some(UiCommand::SetModel(model)) => {
                         self.context_window = known_context_window(&self.provider_name, &model);
                         self.context.set_model(model);
@@ -551,8 +577,12 @@ impl<P: Provider> Agent<P> {
                     Some(UiCommand::SetReasoningEffort(effort)) => {
                         self.context.set_reasoning_effort(effort);
                     }
-                    Some(UiCommand::Approve { id, decision }) => {
-                        self.permissions.resolve(id, decision)
+                    Some(UiCommand::RespondToInteraction(response)) => {
+                        if !self.interactions.respond(response.clone())
+                            && let Some(responder) = &self.interaction_responder
+                        {
+                            let _ = responder(response);
+                        }
                     }
                     Some(UiCommand::Shutdown) | None => return None,
                 }
@@ -615,10 +645,7 @@ impl<P: Provider> Agent<P> {
                 return Ok(stop);
             }
 
-            let results = self
-                .tools
-                .execute(&calls, &self.permissions, events, cancel.clone())
-                .await;
+            let results = self.tools.execute(&calls, events, cancel.clone()).await;
             self.context.accept_tool_results(calls, results);
 
             if cancel.is_cancelled() {
@@ -640,11 +667,12 @@ impl<P: Provider> Agent<P> {
             return Ok(());
         }
         let native = self.provider.supports_native_compaction();
-        let threshold = if native {
-            context_window.saturating_mul(9) / 10
-        } else {
-            context_window.saturating_sub(u64::from(self.context.max_tokens()).min(20_000))
-        };
+        let threshold = compaction_threshold(
+            &self.provider_name,
+            native,
+            context_window,
+            self.context.max_tokens(),
+        );
         let estimated = self.context.estimated_input_tokens();
         if self.last_input_tokens.max(estimated) < threshold {
             return Ok(());
@@ -875,6 +903,12 @@ fn apply_session_effects(
             SessionHookEffect::ExtensionCatalog(catalog) => {
                 let _ = events.send(AgentEvent::ExtensionCatalog(catalog));
             }
+            SessionHookEffect::InteractionRequested(request) => {
+                let _ = events.send(AgentEvent::InteractionRequested(request));
+            }
+            SessionHookEffect::InteractionCancelled(id) => {
+                let _ = events.send(AgentEvent::InteractionCancelled { id });
+            }
             SessionHookEffect::Notice(text) => {
                 let _ = events.send(AgentEvent::CommandHandled(Ok(Some(text))));
             }
@@ -905,6 +939,12 @@ fn poll_session(
             SessionHookEffect::ExtensionCatalog(catalog) => {
                 let _ = events.send(AgentEvent::ExtensionCatalog(catalog));
             }
+            SessionHookEffect::InteractionRequested(request) => {
+                let _ = events.send(AgentEvent::InteractionRequested(request));
+            }
+            SessionHookEffect::InteractionCancelled(id) => {
+                let _ = events.send(AgentEvent::InteractionCancelled { id });
+            }
             SessionHookEffect::Notice(text) => {
                 let _ = events.send(AgentEvent::CommandHandled(Ok(Some(text))));
             }
@@ -921,6 +961,26 @@ fn extension_stop_reason(reason: Option<&StopReason>) -> tokio_agent_extension_a
         Some(StopReason::ToolUse) => tokio_agent_extension_api::StopReason::ToolUse,
         Some(StopReason::Interrupted) => tokio_agent_extension_api::StopReason::Interrupted,
         None => tokio_agent_extension_api::StopReason::Error,
+    }
+}
+
+const OPENAI_DEFAULT_COMPACTION_POINT: u64 = 250_000;
+
+fn compaction_threshold(
+    provider: &str,
+    native: bool,
+    context_window: u64,
+    max_output_tokens: u32,
+) -> u64 {
+    if native {
+        let threshold = context_window.saturating_mul(9) / 10;
+        if provider == "openai" {
+            threshold.min(OPENAI_DEFAULT_COMPACTION_POINT)
+        } else {
+            threshold
+        }
+    } else {
+        context_window.saturating_sub(u64::from(max_output_tokens).min(20_000))
     }
 }
 
@@ -1168,7 +1228,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
             },
             Vec::new(),
-            PermissionEngine::new(Mode::Suggest),
+            None,
             ModelConfig {
                 model: "different-model".into(),
                 system: String::new(),
@@ -1186,6 +1246,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn openai_compaction_is_capped_only_when_default_threshold_exceeds_250k() {
+        assert_eq!(
+            compaction_threshold("openai", true, 372_000, 32_000),
+            250_000
+        );
+        assert_eq!(
+            compaction_threshold("openai", true, 272_000, 32_000),
+            244_800
+        );
+        assert_eq!(
+            compaction_threshold("anthropic", false, 1_000_000, 32_000),
+            980_000
+        );
+    }
+
     #[tokio::test]
     async fn compacts_at_ninety_percent_of_the_context_window() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1194,7 +1270,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             },
             Vec::new(),
-            PermissionEngine::new(Mode::Suggest),
+            None,
             ModelConfig {
                 model: "model".into(),
                 system: String::new(),
@@ -1226,7 +1302,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             },
             Vec::new(),
-            PermissionEngine::new(Mode::Suggest),
+            None,
             ModelConfig {
                 model: "model".into(),
                 system: String::new(),

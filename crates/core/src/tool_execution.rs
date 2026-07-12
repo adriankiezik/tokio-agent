@@ -9,8 +9,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentEvent;
 use crate::context::PendingToolCall;
-use crate::permission::{Outcome, PermissionEngine};
-use crate::tool::{Tool, ToolCtx, ToolDef, ToolResult};
+use crate::tool::{
+    FrontendCapabilities, InteractionBroker, Tool, ToolCtx, ToolDef, ToolGateResult, ToolGateSlot,
+    ToolGateState, ToolInvocation, ToolResult,
+};
 
 #[derive(Clone, Default)]
 pub struct DynamicToolCatalog {
@@ -89,10 +91,19 @@ pub(crate) struct ToolCallExecutor {
     dynamic: DynamicToolCatalog,
     lifecycle: Option<Arc<dyn Fn(String, bool) + Send + Sync>>,
     cwd: PathBuf,
+    gate: ToolGateSlot,
+    interactions: InteractionBroker,
+    frontend: FrontendCapabilities,
 }
 
 impl ToolCallExecutor {
-    pub(crate) fn new(tools: Vec<Arc<dyn Tool>>, cwd: PathBuf) -> Self {
+    pub(crate) fn new(
+        tools: Vec<Arc<dyn Tool>>,
+        cwd: PathBuf,
+        gate: ToolGateSlot,
+        interactions: InteractionBroker,
+        frontend: FrontendCapabilities,
+    ) -> Self {
         let tools: BTreeMap<_, _> = tools
             .into_iter()
             .map(|tool| (tool.schema().name, tool))
@@ -106,6 +117,9 @@ impl ToolCallExecutor {
             dynamic,
             lifecycle: None,
             cwd,
+            gate,
+            interactions,
+            frontend,
         }
     }
 
@@ -115,6 +129,10 @@ impl ToolCallExecutor {
     ) -> Self {
         self.lifecycle = Some(callback);
         self
+    }
+
+    pub(crate) fn set_frontend_capabilities(&mut self, capabilities: FrontendCapabilities) {
+        self.frontend = capabilities;
     }
 
     pub(crate) fn dynamic_catalog(&self) -> DynamicToolCatalog {
@@ -139,7 +157,6 @@ impl ToolCallExecutor {
     pub(crate) async fn execute(
         &mut self,
         calls: &[PendingToolCall],
-        permissions: &PermissionEngine,
         events: &UnboundedSender<AgentEvent>,
         cancel: CancellationToken,
     ) -> Vec<ToolResult> {
@@ -148,10 +165,7 @@ impl ToolCallExecutor {
         let mut running = FuturesUnordered::new();
 
         for (index, call) in calls.iter().enumerate() {
-            match self
-                .prepare(call, permissions, events, cancel.clone())
-                .await
-            {
+            match self.prepare(call, events, cancel.clone()).await {
                 PreparedTool::Immediate(result) => {
                     let _ = events.send(AgentEvent::ToolFinished {
                         id: call.id.clone(),
@@ -213,7 +227,6 @@ impl ToolCallExecutor {
     async fn prepare(
         &mut self,
         call: &PendingToolCall,
-        permissions: &PermissionEngine,
         events: &UnboundedSender<AgentEvent>,
         cancel: CancellationToken,
     ) -> PreparedTool {
@@ -251,21 +264,86 @@ impl ToolCallExecutor {
             }
         };
 
-        let req = tool.permission(&args);
-        let outcome = permissions
-            .decide(&req, cancel.clone(), |id, request| {
-                events
-                    .send(AgentEvent::PermissionNeeded { id, request })
-                    .is_ok()
-            })
-            .await;
+        let invocation = ToolInvocation {
+            invocation_id: call.id.0.clone(),
+            tool_name: call.name.clone(),
+            owner: tool.owner(),
+            arguments: args.clone(),
+            effect: tool.effect(),
+            cwd: self.cwd.clone(),
+            summary_hint: tool
+                .summary(&args)
+                .or_else(|| Some(tool_call_summary(&call.name, &call.raw_args))),
+            frontend: self.frontend.clone(),
+        };
 
-        match outcome {
-            Outcome::Deny if cancel.is_cancelled() => {
+        let decision = match self.gate.snapshot() {
+            ToolGateState::Absent => ToolGateResult::Allow,
+            ToolGateState::Failed(reason) => ToolGateResult::Deny {
+                reason: format!("tool gate unavailable: {reason}"),
+            },
+            ToolGateState::Active(gate) => {
+                let lifecycle = self.gate.lifecycle();
+                let first = tokio::select! {
+                    result = gate.authorize(invocation.clone(), cancel.clone()) => result,
+                    () = lifecycle.cancelled() => ToolGateResult::Deny { reason: "tool gate changed while authorization was pending".into() },
+                };
+                match first {
+                    ToolGateResult::RequestInteraction(request) => {
+                        let receiver = match self.interactions.register(&request) {
+                            Ok(receiver) => receiver,
+                            Err(reason) => {
+                                return PreparedTool::Immediate(ToolResult::error(format!(
+                                    "tool gate protocol error: {reason}"
+                                )));
+                            }
+                        };
+                        if events
+                            .send(AgentEvent::InteractionRequested(request.clone()))
+                            .is_err()
+                        {
+                            self.interactions.cancel(&request.id);
+                            ToolGateResult::Deny {
+                                reason: "frontend unavailable".into(),
+                            }
+                        } else {
+                            let response = tokio::select! {
+                                response = receiver => response.ok(),
+                                () = cancel.cancelled() => None,
+                                () = lifecycle.cancelled() => None,
+                            };
+                            self.interactions.cancel(&request.id);
+                            match response {
+                                Some(response) => {
+                                    gate.respond(invocation.clone(), response, cancel.clone())
+                                        .await
+                                }
+                                None => {
+                                    let _ = events
+                                        .send(AgentEvent::InteractionCancelled { id: request.id });
+                                    ToolGateResult::Deny {
+                                        reason: "cancelled by user".into(),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    result => result,
+                }
+            }
+        };
+
+        match decision {
+            ToolGateResult::Allow => PreparedTool::Run { tool, args },
+            ToolGateResult::Deny { .. } if cancel.is_cancelled() => {
                 PreparedTool::Immediate(ToolResult::error("cancelled by user"))
             }
-            Outcome::Deny => PreparedTool::Immediate(ToolResult::error("denied by user")),
-            Outcome::Run => PreparedTool::Run { tool, args },
+            ToolGateResult::Deny { reason } => {
+                PreparedTool::Immediate(ToolResult::error(format!("denied: {reason}")))
+            }
+            ToolGateResult::RequestInteraction(_) => PreparedTool::Immediate(ToolResult::error(
+                "tool gate protocol error: interaction response did not produce a final decision",
+            )),
         }
     }
 }

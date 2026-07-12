@@ -6,7 +6,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use semver::Version;
 use tokio_agent_extension_api::{
     Capability, CommandId, ExtensionAction, ExtensionId, Sequenced, SessionCommand, StatusSegment,
-    StatusSide, StatusTone, ToolDescriptor, ToolId, ToolPermission,
+    StatusSide, StatusTone, ToolDescriptor, ToolEffect, ToolId,
 };
 use tokio_agent_plugin::{
     ActionError, ActionOutcome, CommandRouter, ExtensionLock, LockedExtension, LockedSource,
@@ -483,6 +483,8 @@ fn action_batches_roll_back_dynamic_tool_collisions() {
         skills: Vec::new(),
         tools: Vec::new(),
         status: Vec::new(),
+        tool_gate: None,
+        cli_options: Vec::new(),
         capabilities: tokio_agent_plugin::Capabilities {
             tools_dynamic: true,
             ..Default::default()
@@ -506,7 +508,7 @@ fn action_batches_roll_back_dynamic_tool_collisions() {
         description: "test".into(),
         input_schema: serde_json::json!({"type":"object"}),
         owner: owner.clone(),
-        permission: ToolPermission::Read,
+        effect: ToolEffect::Read,
     };
     let batch = vec![
         Sequenced {

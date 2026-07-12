@@ -1,25 +1,42 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio_agent_config::{AuthKind, Config, PermissionMode, ProviderKind, ResolvedConfig};
+use tokio_agent_config::{AuthKind, Config, ProviderKind, ResolvedConfig};
 use tokio_agent_core::agent::{Agent, ModelConfig};
-use tokio_agent_core::permission::{Mode, PermissionEngine};
 use tokio_agent_provider::{Anthropic, AnyProvider, DeepSeek, OpenAi};
 
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_system_prompt.md");
 
-pub fn build_session(cwd: &Path, yolo: bool) -> anyhow::Result<Agent<AnyProvider>> {
-    let mut config = Config::load(cwd).context("loading config")?;
-    apply_yolo_override(&mut config, yolo);
-    let config = config.resolve().context("validating config")?;
-    SessionBuilder::new(config, cwd).build()
+static STARTUP_EXTENSION_SETTINGS: std::sync::OnceLock<BTreeMap<String, serde_json::Value>> =
+    std::sync::OnceLock::new();
+
+pub fn set_startup_extension_settings(settings: BTreeMap<String, serde_json::Value>) {
+    let _ = STARTUP_EXTENSION_SETTINGS.set(settings);
 }
 
-fn apply_yolo_override(config: &mut Config, yolo: bool) {
-    if yolo {
-        config.permission_mode = "full-auto".to_owned();
-    }
+pub fn extension_cli_options(
+    cwd: &Path,
+) -> anyhow::Result<Vec<(String, tokio_agent_plugin::CliOptionContribution)>> {
+    let config = Config::load(cwd)?.resolve()?;
+    Ok(load_programmable_packages(cwd, &config.extensions)?
+        .into_iter()
+        .flat_map(|package| {
+            let id = package.manifest.id.clone();
+            package
+                .manifest
+                .cli_options
+                .into_iter()
+                .map(move |option| (id.clone(), option))
+        })
+        .collect())
+}
+
+pub fn build_session(cwd: &Path) -> anyhow::Result<Agent<AnyProvider>> {
+    let config = Config::load(cwd).context("loading config")?;
+    let config = config.resolve().context("validating config")?;
+    SessionBuilder::new(config, cwd).build()
 }
 
 struct SessionBuilder<'a> {
@@ -47,7 +64,7 @@ impl<'a> SessionBuilder<'a> {
             max_tokens,
             context_window_tokens,
             reasoning_effort,
-            permission_mode,
+            extensions,
             system_prompt,
             bash_yield_time_ms,
             bash_timeout_ms,
@@ -56,12 +73,6 @@ impl<'a> SessionBuilder<'a> {
             provider_kind,
             ProviderKind::Anthropic | ProviderKind::OpenAi | ProviderKind::DeepSeek
         );
-        let mode = match permission_mode {
-            PermissionMode::Suggest => Mode::Suggest,
-            PermissionMode::AutoEdit => Mode::AutoEdit,
-            PermissionMode::FullAuto => Mode::FullAuto,
-        };
-
         let tools = tools_for_provider(provider_kind, bash_yield_time_ms, bash_timeout_ms);
 
         let provider = match provider_kind {
@@ -84,7 +95,7 @@ impl<'a> SessionBuilder<'a> {
         let mut agent = Agent::new(
             provider,
             tools,
-            PermissionEngine::new(mode),
+            None,
             ModelConfig {
                 model,
                 system,
@@ -94,9 +105,19 @@ impl<'a> SessionBuilder<'a> {
             self.cwd.to_path_buf(),
         );
         let extension_runtime = crate::extension_runtime::ExtensionRuntime::start(
-            load_programmable_packages(self.cwd)?,
+            load_programmable_packages(self.cwd, &extensions)?,
             agent.dynamic_tools(),
         )?;
+        let gate_slot = agent.tool_gate_slot();
+        if let Some(gate) = extension_runtime.tool_gate(gate_slot.clone()) {
+            gate_slot.attach(gate);
+        }
+        let interaction_runtime = extension_runtime.clone();
+        agent = agent.with_interaction_responder(move |response| {
+            interaction_runtime
+                .respond_to_interaction(response)
+                .map_err(|error| error.to_string())
+        });
         let route_runtime = extension_runtime.clone();
         let route_router = Arc::clone(&command_router);
         agent = agent
@@ -115,6 +136,7 @@ impl<'a> SessionBuilder<'a> {
         let watcher_router = Arc::clone(&command_router);
         let watcher_runtime = extension_runtime.clone();
         let watcher_cwd = self.cwd.to_path_buf();
+        let watcher_settings = extensions.clone();
         let watcher_state = Arc::new(std::sync::Mutex::new((
             std::time::Instant::now(),
             command_catalog,
@@ -129,7 +151,8 @@ impl<'a> SessionBuilder<'a> {
             if state.0.elapsed() >= std::time::Duration::from_millis(500) {
                 state.0 = std::time::Instant::now();
                 if let Ok(router) = build_command_router(&watcher_cwd)
-                    && let Ok(packages) = load_programmable_packages(&watcher_cwd)
+                    && let Ok(packages) =
+                        load_programmable_packages(&watcher_cwd, &watcher_settings)
                     && watcher_runtime.load(packages).is_ok()
                 {
                     let catalog = router.catalog();
@@ -289,13 +312,7 @@ fn load_prompt_commands(
                 }),
         );
     }
-    let reserved = [
-        "/clear",
-        "/model",
-        "/permissions",
-        "/providers",
-        "/extensions",
-    ];
+    let reserved = ["/clear", "/model", "/providers", "/extensions"];
     let mut names = BTreeMap::new();
     for command in &commands {
         if reserved.contains(&command.descriptor.name.as_str()) {
@@ -338,6 +355,7 @@ fn load_prompt_commands(
 
 fn load_programmable_packages(
     cwd: &Path,
+    extension_settings: &BTreeMap<String, toml::Value>,
 ) -> anyhow::Result<Vec<crate::extension_runtime::ProgrammablePackage>> {
     use tokio_agent_plugin::{CapabilityGrant, ExtensionConfig, LockedSource};
     let user_path = dirs::config_dir().map(|path| path.join("tokio-agent/extensions.toml"));
@@ -359,21 +377,33 @@ fn load_programmable_packages(
         if manifest.runtime.is_none() {
             continue;
         }
-        let (registry_identity, publisher) =
+        let (registry_identity, publisher, privileged_source) =
             if project.linked.contains_key(&id) || user.linked.contains_key(&id) {
-                ("local".to_owned(), "local".to_owned())
+                ("local".to_owned(), "local".to_owned(), true)
             } else {
                 let record = records
                     .extensions
                     .iter()
                     .find(|entry| entry.id == id)
                     .with_context(|| format!("missing installation identity for `{id}`"))?;
-                let identity = match &record.source {
-                    LockedSource::Registry { root_identity, .. } => root_identity.clone(),
-                    LockedSource::Local { .. } => "local".to_owned(),
+                let (identity, privileged_source) = match &record.source {
+                    LockedSource::Registry { root_identity, url } => (
+                        root_identity.clone(),
+                        url == tokio_agent_plugin::OFFICIAL_REGISTRY_URL,
+                    ),
+                    LockedSource::Local { .. } => ("local".to_owned(), true),
                 };
-                (identity, record.publisher.clone().unwrap_or_default())
+                (
+                    identity,
+                    record.publisher.clone().unwrap_or_default(),
+                    privileged_source,
+                )
             };
+        if manifest.tool_gate.is_some()
+            && (!manifest.id.starts_with("tokio.") || !privileged_source)
+        {
+            anyhow::bail!("extension `{id}` cannot claim privileged global tool-gating authority");
+        }
         let grant = CapabilityGrant {
             registry_identity,
             extension_id: id.clone(),
@@ -388,7 +418,35 @@ fn load_programmable_packages(
                 "extension `{id}` capabilities have not been approved for this exact source and publisher"
             );
         }
-        packages.push(crate::extension_runtime::ProgrammablePackage { root, manifest });
+        let settings = extension_settings
+            .get(&id)
+            .map(serde_json::to_value)
+            .transpose()?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let startup_settings = STARTUP_EXTENSION_SETTINGS
+            .get()
+            .and_then(|all| all.get(&id))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let component = manifest
+            .runtime
+            .as_ref()
+            .map(|runtime| root.join(&runtime.component));
+        let metadata = component.as_ref().map(std::fs::metadata).transpose()?;
+        let modified = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
+        let fingerprint =
+            modified ^ u128::from(metadata.as_ref().map_or(0, std::fs::Metadata::len));
+        packages.push(crate::extension_runtime::ProgrammablePackage {
+            root,
+            manifest,
+            settings,
+            startup_settings,
+            fingerprint,
+        });
     }
     Ok(packages)
 }
@@ -635,9 +693,6 @@ fn route_command(
         RoutedCommand::BuiltIn(BuiltInCommand::OpenModelPicker) => {
             return Err("/model requires the interactive frontend".to_owned());
         }
-        RoutedCommand::BuiltIn(BuiltInCommand::OpenPermissionsPicker) => {
-            return Err("/permissions requires the interactive frontend".to_owned());
-        }
         RoutedCommand::BuiltIn(BuiltInCommand::OpenProviderPicker) => {
             return Err("/providers requires the interactive frontend".to_owned());
         }
@@ -650,7 +705,9 @@ fn route_command(
                 .map_err(|error| error.to_string())?;
             extension_command_result(&id, prompt)
         }
-        RoutedCommand::Interrupt | RoutedCommand::Approve { .. } | RoutedCommand::Shutdown => {
+        RoutedCommand::Interrupt
+        | RoutedCommand::RespondToInteraction(_)
+        | RoutedCommand::Shutdown => {
             return Err("invalid routed command".to_owned());
         }
     })
@@ -697,42 +754,6 @@ fn tools_for_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn config(permission_mode: &str) -> Config {
-        Config {
-            provider: "anthropic".into(),
-            model: "test".into(),
-            api_base: None,
-            auth: None,
-            max_tokens: 1024,
-            context_window_tokens: None,
-            reasoning_effort: None,
-            permission_mode: permission_mode.into(),
-            system_prompt: None,
-            bash_yield_time_ms: 10_000,
-            bash_timeout_ms: 600_000,
-        }
-    }
-
-    #[test]
-    fn yolo_overrides_the_configured_permission_mode() {
-        let mut config = config("suggest");
-        apply_yolo_override(&mut config, true);
-        assert_eq!(
-            config.resolve().unwrap().permission_mode,
-            PermissionMode::FullAuto
-        );
-    }
-
-    #[test]
-    fn permission_mode_is_unchanged_without_yolo() {
-        let mut config = config("auto-edit");
-        apply_yolo_override(&mut config, false);
-        assert_eq!(
-            config.resolve().unwrap().permission_mode,
-            PermissionMode::AutoEdit
-        );
-    }
 
     #[test]
     fn programmable_command_without_a_prompt_is_still_handled() {

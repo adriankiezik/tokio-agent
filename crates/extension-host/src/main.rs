@@ -108,7 +108,15 @@ impl Host {
                     .exports(&self.engine)
                     .map(|(name, _)| name.to_owned())
                     .collect();
-                for required in ["on-command", "on-event", "on-tool", "restore-session-state"] {
+                for required in [
+                    "on-command",
+                    "on-event",
+                    "on-tool",
+                    "authorize-tool",
+                    "on-interaction-response",
+                    "load-state",
+                    "restore-session-state",
+                ] {
                     if !exports.contains(required) {
                         return Err((
                             None,
@@ -125,11 +133,39 @@ impl Host {
                 component_path,
                 capabilities: _,
                 limits,
+                user_state,
+                settings,
+                startup_settings,
             } => {
-                let instance = self
+                let settings_size = settings
+                    .to_string()
+                    .len()
+                    .saturating_add(startup_settings.to_string().len());
+                if user_state.len().saturating_add(settings_size)
+                    > limits.maximum_payload_bytes as usize
+                {
+                    return Err((
+                        Some(extension),
+                        "extension load state exceeded its limit".into(),
+                        false,
+                    ));
+                }
+                let mut instance = self
                     .load(&component_path, generation, limits)
                     .await
                     .map_err(|error| (Some(extension.clone()), error.to_string(), false))?;
+                let settings = settings.to_string();
+                let startup_settings = startup_settings.to_string();
+                instance
+                    .bindings
+                    .call_load_state(
+                        &mut instance.store,
+                        &user_state,
+                        &[],
+                        &settings,
+                        &startup_settings,
+                    )
+                    .map_err(|error| (Some(extension.clone()), error.to_string(), true))?;
                 self.instances.insert(extension.clone(), instance);
                 Ok(HostResponse::Loaded {
                     extension,
@@ -175,6 +211,53 @@ impl Host {
                     is_error: result.is_error,
                     actions,
                 })
+            }
+            HostRequest::AuthorizeTool {
+                extension,
+                generation,
+                handler,
+                invocation,
+            } => {
+                let json = serde_json::to_string(&invocation)
+                    .map_err(|error| (Some(extension.clone()), error.to_string(), false))?;
+                let output = self
+                    .invoke_gate(&extension, generation, &handler, &json, None)
+                    .await?;
+                let result = serde_json::from_str(&output).map_err(|error| {
+                    (
+                        Some(extension.clone()),
+                        format!("invalid tool gate result: {error}"),
+                        false,
+                    )
+                })?;
+                Ok(HostResponse::ToolGateResult(result))
+            }
+            HostRequest::InteractionResponse {
+                extension,
+                generation,
+                handler,
+                invocation_id,
+                response,
+            } => {
+                let json = serde_json::to_string(&response)
+                    .map_err(|error| (Some(extension.clone()), error.to_string(), false))?;
+                let output = self
+                    .invoke_gate(
+                        &extension,
+                        generation,
+                        &handler,
+                        &json,
+                        Some(&invocation_id),
+                    )
+                    .await?;
+                let result = serde_json::from_str(&output).map_err(|error| {
+                    (
+                        Some(extension.clone()),
+                        format!("invalid tool gate result: {error}"),
+                        false,
+                    )
+                })?;
+                Ok(HostResponse::ToolGateResult(result))
             }
             HostRequest::RestoreSessionState {
                 extension,
@@ -336,6 +419,48 @@ impl Host {
         let result = instance.bindings.call_on_event(&mut instance.store, event);
         callback_running.store(false, Ordering::Release);
         self.finish_callback(extension, generation, result)
+    }
+
+    async fn invoke_gate(
+        &mut self,
+        extension: &ExtensionId,
+        generation: u64,
+        handler: &str,
+        json: &str,
+        invocation_id: Option<&str>,
+    ) -> Result<String, (Option<ExtensionId>, String, bool)> {
+        let engine = self.engine.clone();
+        let instance = self.instance(extension, generation)?;
+        if handler.len().saturating_add(json.len()) > instance.limits.maximum_payload_bytes as usize
+        {
+            return Err((
+                Some(extension.clone()),
+                "tool gate input exceeded its limit".into(),
+                false,
+            ));
+        }
+        let callback_running = deadline_guard(
+            engine,
+            Duration::from_millis(instance.limits.callback_deadline_ms),
+        );
+        instance
+            .store
+            .set_fuel(instance.limits.fuel_per_callback)
+            .map_err(|error| (Some(extension.clone()), error.to_string(), true))?;
+        instance.store.set_epoch_deadline(1);
+        let result = match invocation_id {
+            Some(id) => instance.bindings.call_on_interaction_response(
+                &mut instance.store,
+                handler,
+                id,
+                json,
+            ),
+            None => instance
+                .bindings
+                .call_authorize_tool(&mut instance.store, handler, json),
+        };
+        callback_running.store(false, Ordering::Release);
+        result.map_err(|error| (Some(extension.clone()), error.to_string(), true))
     }
 
     async fn invoke_tool(
@@ -524,7 +649,18 @@ async fn main() -> anyhow::Result<()> {
     let mut stdout = tokio::io::stdout();
     while let Some(line) = lines.next_line().await? {
         let response = match serde_json::from_str::<HostRequest>(&line) {
-            Ok(request) => host.handle(request).await,
+            Ok(request) => {
+                let shutdown = matches!(request, HostRequest::Shutdown);
+                let response = host.handle(request).await;
+                if shutdown {
+                    let mut encoded = serde_json::to_vec(&response)?;
+                    encoded.push(b'\n');
+                    stdout.write_all(&encoded).await?;
+                    stdout.flush().await?;
+                    break;
+                }
+                response
+            }
             Err(error) => HostResponse::Error {
                 extension: None,
                 message: format!("invalid host request: {error}"),

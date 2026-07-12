@@ -18,6 +18,9 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo check --workspace
       - run: cargo test -p tokio-agent-plugin --test extension_system
+      - run: cargo test --manifest-path registry/extensions/permissions/Cargo.toml
+      - run: cargo check --manifest-path registry/extensions/loop/Cargo.toml
+      - run: cargo check --manifest-path registry/extensions/goal/Cargo.toml
 
   invariants:
     runs-on: ubuntu-latest

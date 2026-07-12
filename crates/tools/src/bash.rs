@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Child;
 use tokio::sync::Notify;
 use tokio_agent_core::provider::BoxFuture;
-use tokio_agent_core::tool::{Action, PermissionRequest, Tool, ToolCtx, ToolDef, ToolResult};
+use tokio_agent_core::tool::{Tool, ToolCtx, ToolDef, ToolEffect, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 const MIN_YIELD_MS: u64 = 250;
@@ -122,16 +122,15 @@ impl Tool for Bash {
         }
     }
 
-    fn permission(&self, input: &Value) -> PermissionRequest {
-        let command = input
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Execute
+    }
+
+    fn summary(&self, input: &Value) -> Option<String> {
+        input
             .get("command")
             .and_then(Value::as_str)
-            .unwrap_or("<missing>");
-        PermissionRequest {
-            tool: "bash".to_owned(),
-            summary: format!("run: {command}"),
-            action: Action::Execute,
-        }
+            .map(|command| format!("run: {command}"))
     }
 
     fn run<'a>(&'a self, input: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {
@@ -212,12 +211,12 @@ impl Tool for BashWait {
         }
     }
 
-    fn permission(&self, input: &Value) -> PermissionRequest {
-        PermissionRequest {
-            tool: "bash".to_owned(),
-            summary: format!("poll process: {}", process_id_for_summary(input)),
-            action: Action::Read,
-        }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Read
+    }
+
+    fn summary(&self, input: &Value) -> Option<String> {
+        Some(format!("poll process: {}", process_id_for_summary(input)))
     }
 
     fn run<'a>(&'a self, input: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {
@@ -262,12 +261,15 @@ impl Tool for BashKill {
         }
     }
 
-    fn permission(&self, input: &Value) -> PermissionRequest {
-        PermissionRequest {
-            tool: "bash".to_owned(),
-            summary: format!("terminate process: {}", process_id_for_summary(input)),
-            action: Action::Read,
-        }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Read
+    }
+
+    fn summary(&self, input: &Value) -> Option<String> {
+        Some(format!(
+            "terminate process: {}",
+            process_id_for_summary(input)
+        ))
     }
 
     fn run<'a>(&'a self, input: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {

@@ -31,6 +31,11 @@ pub enum SupervisorEffect {
     SessionStateStored {
         owner: ExtensionId,
     },
+    UserStateStored {
+        owner: ExtensionId,
+        bytes: Vec<u8>,
+    },
+    InteractionRequested(tokio_agent_extension_api::InteractionRequest),
     AutonomyReleased {
         owner: ExtensionId,
     },
@@ -49,12 +54,30 @@ pub enum RuntimeError {
     Companion(#[from] CompanionError),
     #[error(transparent)]
     Action(#[from] ActionError),
+    #[error(transparent)]
+    UserState(#[from] crate::UserStateError),
     #[error("extension host returned an unexpected response")]
     Protocol,
     #[error("dynamic tool name `{0}` conflicts with another enabled extension")]
     ToolCollision(String),
     #[error("dynamic tool owner does not match the acting extension")]
     ToolOwner,
+    #[error("tool gate returned a stale or wrong-owner interaction")]
+    GateProtocol,
+}
+
+fn validate_gate_interaction(
+    owner: &ExtensionId,
+    generation: u64,
+    response: &tokio_agent_extension_api::ToolGateResponse,
+) -> Result<(), RuntimeError> {
+    if let tokio_agent_extension_api::ToolGateResponse::RequestInteraction { interaction, .. } =
+        response
+        && (&interaction.owner != owner || interaction.generation != generation)
+    {
+        return Err(RuntimeError::GateProtocol);
+    }
+    Ok(())
 }
 
 /// Frontend- and provider-neutral session-service runtime. It owns extension
@@ -97,12 +120,33 @@ impl SessionSupervisor {
         package_root: &Path,
         limits: RuntimeLimits,
     ) -> Result<u64, RuntimeError> {
+        self.enable_programmable_with_settings(
+            manifest,
+            package_root,
+            limits,
+            serde_json::Value::Object(Default::default()),
+            serde_json::Value::Object(Default::default()),
+        )
+        .await
+    }
+
+    pub async fn enable_programmable_with_settings(
+        &mut self,
+        manifest: &ExtensionManifest,
+        package_root: &Path,
+        limits: RuntimeLimits,
+        mut settings: serde_json::Value,
+        startup_settings: serde_json::Value,
+    ) -> Result<u64, RuntimeError> {
         let id = ExtensionId::new(&manifest.id);
         let capabilities = manifest.capabilities.as_set();
         let generation = self.state.enable(id.clone(), capabilities.iter().copied());
         let Some(runtime) = &manifest.runtime else {
             return Ok(generation);
         };
+        if let Some(object) = settings.as_object_mut() {
+            object.insert("_host_generation".into(), generation.into());
+        }
         let response = self
             .companion
             .request(&HostRequest::Load {
@@ -114,6 +158,9 @@ impl SessionSupervisor {
                     .into_owned(),
                 capabilities: capabilities.into_iter().collect(),
                 limits,
+                user_state: crate::load_user_state(&id)?,
+                settings,
+                startup_settings,
             })
             .await?;
         match response {
@@ -208,6 +255,94 @@ impl SessionSupervisor {
             .await?
         {
             HostResponse::Actions(actions) => self.apply_actions(actions),
+            _ => Err(RuntimeError::Protocol),
+        }
+    }
+
+    pub fn apply_gate_response(
+        &mut self,
+        owner: ExtensionId,
+        generation: u64,
+        mut response: tokio_agent_extension_api::ToolGateResponse,
+    ) -> Result<
+        (
+            tokio_agent_extension_api::ToolGateResponse,
+            Vec<SupervisorEffect>,
+        ),
+        RuntimeError,
+    > {
+        let actions = match &mut response {
+            tokio_agent_extension_api::ToolGateResponse::Allow { actions }
+            | tokio_agent_extension_api::ToolGateResponse::Deny { actions, .. }
+            | tokio_agent_extension_api::ToolGateResponse::RequestInteraction { actions, .. } => {
+                std::mem::take(actions)
+            }
+        };
+        let sequenced = actions
+            .into_iter()
+            .map(|value| {
+                let sequence = self.next_event_sequence;
+                self.next_event_sequence = self.next_event_sequence.saturating_add(1);
+                Sequenced {
+                    sequence,
+                    extension: owner.clone(),
+                    generation,
+                    value,
+                }
+            })
+            .collect();
+        let effects = self.apply_actions(sequenced)?;
+        Ok((response, effects))
+    }
+
+    pub async fn authorize_tool(
+        &mut self,
+        extension: ExtensionId,
+        generation: u64,
+        handler: String,
+        invocation: tokio_agent_extension_api::ToolGateInvocation,
+    ) -> Result<tokio_agent_extension_api::ToolGateResponse, RuntimeError> {
+        match self
+            .companion
+            .request(&HostRequest::AuthorizeTool {
+                extension: extension.clone(),
+                generation,
+                handler,
+                invocation,
+            })
+            .await?
+        {
+            HostResponse::ToolGateResult(result) => {
+                validate_gate_interaction(&extension, generation, &result)?;
+                Ok(result)
+            }
+            _ => Err(RuntimeError::Protocol),
+        }
+    }
+
+    pub async fn respond_to_interaction(
+        &mut self,
+        extension: ExtensionId,
+        generation: u64,
+        handler: String,
+        invocation_id: String,
+        response: tokio_agent_extension_api::InteractionResponse,
+    ) -> Result<tokio_agent_extension_api::ToolGateResponse, RuntimeError> {
+        match self
+            .companion
+            .request(&HostRequest::InteractionResponse {
+                extension: extension.clone(),
+                generation,
+                handler,
+                invocation_id,
+                response,
+            })
+            .await?
+        {
+            HostResponse::ToolGateResult(result) => {
+                validate_gate_interaction(&extension, generation, &result)?;
+                Ok(result)
+            }
             _ => Err(RuntimeError::Protocol),
         }
     }
@@ -436,6 +571,13 @@ impl SessionSupervisor {
                 self.session_state.insert(owner.clone(), bytes);
                 Ok(SupervisorEffect::SessionStateStored { owner })
             }
+            (ExtensionAction::PersistUserState(bytes), ActionOutcome::UserStatePersisted) => {
+                Ok(SupervisorEffect::UserStateStored { owner, bytes })
+            }
+            (
+                ExtensionAction::RequestInteraction(request),
+                ActionOutcome::InteractionRequested(_),
+            ) => Ok(SupervisorEffect::InteractionRequested(request)),
             (ExtensionAction::Steer { text }, ActionOutcome::Steering(_)) => {
                 Ok(SupervisorEffect::SubmitPrompt {
                     text,

@@ -34,6 +34,10 @@ pub enum ManifestError {
     MissingFile(PathBuf),
     #[error("a runtime component is present but no executable capability was declared")]
     RuntimeWithoutCapability,
+    #[error("tool_gate contribution requires the tool_gate and interaction_request capabilities")]
+    ToolGateCapability,
+    #[error("invalid CLI option `{0}`")]
+    CliOption(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +61,10 @@ pub struct ExtensionManifest {
     #[serde(default, rename = "status")]
     pub status: Vec<StatusContribution>,
     #[serde(default)]
+    pub tool_gate: Option<ToolGateContribution>,
+    #[serde(default)]
+    pub cli_options: Vec<CliOptionContribution>,
+    #[serde(default)]
     pub capabilities: Capabilities,
 }
 
@@ -64,6 +72,31 @@ pub struct ExtensionManifest {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeContribution {
     pub component: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolGateContribution {
+    pub handler: String,
+    #[serde(default = "default_interaction_handler")]
+    pub interaction_handler: String,
+}
+
+fn default_interaction_handler() -> String {
+    "on_interaction_response".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliOptionContribution {
+    pub long: String,
+    pub value_name: String,
+    #[serde(default)]
+    pub values: Vec<String>,
+    pub description: String,
+    pub handler: String,
+    #[serde(default)]
+    pub secret: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +171,8 @@ pub struct Capabilities {
     pub status_write: bool,
     pub storage_session: bool,
     pub storage_user: bool,
+    pub tool_gate: bool,
+    pub interaction_request: bool,
     pub subagents_spawn: bool,
     pub filesystem_read: bool,
     pub filesystem_edit: bool,
@@ -155,6 +190,8 @@ impl Capabilities {
             || self.status_write
             || self.storage_session
             || self.storage_user
+            || self.tool_gate
+            || self.interaction_request
             || self.subagents_spawn
             || self.filesystem_read
             || self.filesystem_edit
@@ -176,6 +213,8 @@ impl Capabilities {
             (self.status_write, Capability::StatusWrite),
             (self.storage_session, Capability::StorageSession),
             (self.storage_user, Capability::StorageUser),
+            (self.tool_gate, Capability::ToolGate),
+            (self.interaction_request, Capability::InteractionRequest),
             (self.subagents_spawn, Capability::SubagentsSpawn),
             (self.filesystem_read, Capability::FilesystemRead),
             (self.filesystem_edit, Capability::FilesystemEdit),
@@ -207,6 +246,23 @@ impl ExtensionManifest {
         Version::parse(&self.version).map_err(|_| ManifestError::Version(self.version.clone()))?;
         VersionReq::parse(&normalize_requirement(&self.host_api))
             .map_err(|_| ManifestError::HostApi(self.host_api.clone()))?;
+        if let Some(gate) = &self.tool_gate {
+            validate_symbol_name(&gate.handler)?;
+            validate_symbol_name(&gate.interaction_handler)?;
+            if !self.capabilities.tool_gate || !self.capabilities.interaction_request {
+                return Err(ManifestError::ToolGateCapability);
+            }
+        }
+        let mut cli_names = BTreeSet::new();
+        for option in &self.cli_options {
+            validate_name(&option.long)
+                .map_err(|_| ManifestError::CliOption(option.long.clone()))?;
+            validate_symbol_name(&option.handler)
+                .map_err(|_| ManifestError::CliOption(option.long.clone()))?;
+            if option.secret || option.values.is_empty() || !cli_names.insert(&option.long) {
+                return Err(ManifestError::CliOption(option.long.clone()));
+            }
+        }
         let mut commands = BTreeSet::new();
         for command in &self.commands {
             validate_name(&command.name)?;
@@ -258,6 +314,8 @@ impl ExtensionManifest {
             .any(|command| command.handler.is_some())
             || !self.tools.is_empty()
             || !self.status.is_empty()
+            || self.tool_gate.is_some()
+            || !self.cli_options.is_empty()
         {
             return Err(ManifestError::MissingFile(PathBuf::from(
                 "runtime.component",

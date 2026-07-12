@@ -34,6 +34,7 @@ string_id!(ExtensionId);
 string_id!(CommandId);
 string_id!(ToolId);
 string_id!(TimerId);
+string_id!(InteractionId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -62,16 +63,88 @@ pub enum SessionCommand {
     SubmitMessage(String),
     InvokeCommand { id: CommandId, arguments: String },
     Interrupt,
-    Approve { id: u64, decision: ApprovalDecision },
+    RespondToInteraction(InteractionResponse),
     Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionResponse {
+    pub id: InteractionId,
+    pub owner: ExtensionId,
+    pub generation: u64,
+    pub action_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ApprovalDecision {
-    AllowOnce,
-    AllowAlways,
-    Deny,
+pub enum InteractionTone {
+    Neutral,
+    Primary,
+    Destructive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionAction {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_hint: Option<String>,
+    pub tone: InteractionTone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalSpec {
+    pub title: String,
+    #[serde(default)]
+    pub body: Vec<TextSection>,
+    pub actions: Vec<InteractionAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SingleSelectSpec {
+    pub title: String,
+    pub options: Vec<SelectOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "spec")]
+pub enum InteractionSpec {
+    Approval(ApprovalSpec),
+    SingleSelect(SingleSelectSpec),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionRequest {
+    pub id: InteractionId,
+    pub owner: ExtensionId,
+    pub generation: u64,
+    pub spec: InteractionSpec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,16 +192,78 @@ pub struct ToolDescriptor {
     pub input_schema: serde_json::Value,
     pub owner: ExtensionId,
     #[serde(default)]
-    pub permission: ToolPermission,
+    pub effect: ToolEffect,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolPermission {
+pub enum ToolEffect {
     Read,
     Edit,
-    #[default]
     Execute,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ToolOwner {
+    BuiltIn,
+    Extension { id: ExtensionId, version: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendCapabilities {
+    pub interactive: bool,
+    pub copy: bool,
+    #[serde(default)]
+    pub interaction_kinds: Vec<String>,
+}
+
+impl Default for FrontendCapabilities {
+    fn default() -> Self {
+        Self {
+            interactive: true,
+            copy: true,
+            interaction_kinds: vec!["approval".into(), "single_select".into()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolGateInvocation {
+    pub gate_owner: ExtensionId,
+    pub gate_generation: u64,
+    pub invocation_id: String,
+    pub tool_name: String,
+    pub owner: ToolOwner,
+    pub arguments: serde_json::Value,
+    pub effect: ToolEffect,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_hint: Option<String>,
+    pub frontend: FrontendCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "decision")]
+pub enum ToolGateResponse {
+    Allow {
+        #[serde(default)]
+        actions: Vec<ExtensionAction>,
+    },
+    Deny {
+        reason: String,
+        #[serde(default)]
+        actions: Vec<ExtensionAction>,
+    },
+    RequestInteraction {
+        interaction: InteractionRequest,
+        #[serde(default)]
+        actions: Vec<ExtensionAction>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,6 +279,8 @@ pub enum ExtensionAction {
     ScheduleTimer { id: TimerId, after: DurationDto },
     CancelTimer(TimerId),
     PersistSessionState(Vec<u8>),
+    PersistUserState(Vec<u8>),
+    RequestInteraction(InteractionRequest),
     ReleaseAutonomy,
 }
 
@@ -203,6 +340,8 @@ pub enum Capability {
     StatusWrite,
     StorageSession,
     StorageUser,
+    ToolGate,
+    InteractionRequest,
     SubagentsSpawn,
     FilesystemRead,
     FilesystemEdit,
@@ -299,6 +438,12 @@ pub enum HostRequest {
         component_path: String,
         capabilities: Vec<Capability>,
         limits: RuntimeLimits,
+        #[serde(default)]
+        user_state: Vec<u8>,
+        #[serde(default)]
+        settings: serde_json::Value,
+        #[serde(default)]
+        startup_settings: serde_json::Value,
     },
     InvokeCommand {
         extension: ExtensionId,
@@ -311,6 +456,19 @@ pub enum HostRequest {
         generation: u64,
         handler: String,
         arguments_json: String,
+    },
+    AuthorizeTool {
+        extension: ExtensionId,
+        generation: u64,
+        handler: String,
+        invocation: ToolGateInvocation,
+    },
+    InteractionResponse {
+        extension: ExtensionId,
+        generation: u64,
+        handler: String,
+        invocation_id: String,
+        response: InteractionResponse,
     },
     SessionEvent(Sequenced<SessionEvent>),
     RestoreSessionState {
@@ -344,6 +502,7 @@ pub enum HostResponse {
         #[serde(default)]
         actions: Vec<Sequenced<ExtensionAction>>,
     },
+    ToolGateResult(ToolGateResponse),
     SessionStateRestored {
         extension: ExtensionId,
         generation: u64,

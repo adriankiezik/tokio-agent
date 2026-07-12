@@ -8,10 +8,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use tokio_agent_core::agent::{AgentEvent, UiCommand};
 use tokio_agent_core::message::{ToolOutput, Usage};
-use tokio_agent_core::permission::{Decision, Mode, PermissionId};
-use tokio_agent_core::tool::{Action, PermissionRequest};
 use tokio_agent_extension_api::{
-    CommandDescriptor, CommandId, CommandSource, ExtensionSummary, StatusSegment,
+    CommandDescriptor, CommandId, CommandSource, ExtensionSummary, InteractionRequest,
+    InteractionResponse, InteractionSpec, StatusSegment,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -56,43 +55,17 @@ struct SlashCommand {
 enum SlashAction {
     Clear,
     Model,
-    Permissions,
     Provider,
     Extensions,
     Extension(CommandId),
 }
 
-#[derive(Clone, Copy)]
-struct PermissionModeOption {
-    mode: Mode,
-    name: &'static str,
-    description: &'static str,
-}
-
-const PERMISSION_MODES: [PermissionModeOption; 3] = [
-    PermissionModeOption {
-        mode: Mode::Suggest,
-        name: "Suggest",
-        description: "Ask before edits and commands",
-    },
-    PermissionModeOption {
-        mode: Mode::AutoEdit,
-        name: "Auto-edit",
-        description: "Allow edits; ask before commands",
-    },
-    PermissionModeOption {
-        mode: Mode::FullAuto,
-        name: "Full-auto",
-        description: "Allow edits and commands without asking",
-    },
-];
-
 const QUIT_CONFIRMATION: Duration = Duration::from_secs(3);
 const NOTIFICATION_DURATION: Duration = Duration::from_secs(3);
 
 struct Pending {
-    id: PermissionId,
-    request: PermissionRequest,
+    request: InteractionRequest,
+    selected: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -147,8 +120,6 @@ pub(crate) struct FrontendProjection {
     history_cursor: Option<usize>,
     history_draft: String,
     history_entry_to_persist: Option<String>,
-    permission_mode: Mode,
-    permissions_selected: Option<usize>,
     setting_picker: Option<SettingPicker>,
     provider_change_notice: bool,
     last_request_usage: Usage,
@@ -175,7 +146,6 @@ impl FrontendProjection {
         cwd: String,
         context_window: Option<u64>,
         max_output_tokens: u32,
-        permission_mode: Mode,
         history: Vec<String>,
         extension_commands: Vec<CommandDescriptor>,
         extensions: Vec<ExtensionSummary>,
@@ -201,8 +171,6 @@ impl FrontendProjection {
             history_cursor: None,
             history_draft: String::new(),
             history_entry_to_persist: None,
-            permission_mode,
-            permissions_selected: None,
             setting_picker: None,
             provider_change_notice: false,
             last_request_usage: Usage::default(),
@@ -233,7 +201,6 @@ impl FrontendProjection {
         cwd: String,
         context_window: Option<u64>,
         max_output_tokens: u32,
-        permission_mode: Mode,
         commands: Vec<CommandDescriptor>,
         extensions: Vec<ExtensionSummary>,
     ) {
@@ -243,7 +210,6 @@ impl FrontendProjection {
         self.cwd = cwd;
         self.context_window = context_window;
         self.max_output_tokens = max_output_tokens;
-        self.permission_mode = permission_mode;
         self.extension_commands = commands.into_iter().map(extension_slash_command).collect();
         self.extensions = extensions;
         self.installing_extension = None;
@@ -254,7 +220,6 @@ impl FrontendProjection {
         self.running = false;
         self.interrupting = false;
         self.setting_picker = None;
-        self.permissions_selected = None;
         self.provider_change_notice = false;
         self.started_at = None;
         self.elapsed = Duration::ZERO;
@@ -349,9 +314,6 @@ impl FrontendProjection {
             }
             return FrontendEffect::None;
         }
-        if let Some(effect) = self.handle_permissions_key(key) {
-            return effect;
-        }
         if let Some(effect) = self.handle_setting_key(key) {
             return effect;
         }
@@ -374,7 +336,6 @@ impl FrontendProjection {
         }
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         self.quit_armed_until = None;
-        self.permissions_selected = None;
         self.command_error = None;
         self.composer.insert_str(&normalized);
         self.leave_history();
@@ -390,9 +351,6 @@ impl FrontendProjection {
             self.provider_change_notice = false;
             return Some(FrontendEffect::ConfigureProvider);
         }
-        if self.permissions_selected.take().is_some() {
-            return Some(FrontendEffect::None);
-        }
         if self.setting_picker.take().is_some() {
             return Some(FrontendEffect::None);
         }
@@ -405,45 +363,68 @@ impl FrontendProjection {
     }
 
     fn handle_pending_key(&mut self, code: KeyCode, ctrl: bool) -> Option<FrontendEffect> {
-        let pending = self.pending.as_ref()?;
+        let pending = self.pending.as_mut()?;
         if code == KeyCode::Char('c') && !ctrl {
-            return Some(FrontendEffect::Copy(permission_copy_text(&pending.request)));
-        }
-        let id = pending.id;
-        let decision = match code {
-            KeyCode::Char('c') if ctrl => {
-                self.interrupting = true;
-                return Some(FrontendEffect::Command(UiCommand::Interrupt));
+            if let InteractionSpec::Approval(spec) = &pending.request.spec
+                && let Some(text) = &spec.copy_text
+            {
+                return Some(FrontendEffect::Copy(text.clone()));
             }
-            KeyCode::Char('y') => Decision::AllowOnce,
-            KeyCode::Char('a') => Decision::AllowAlways,
-            KeyCode::Char('n') | KeyCode::Esc => Decision::Deny,
-            _ => return Some(FrontendEffect::None),
+        }
+        if code == KeyCode::Char('c') && ctrl {
+            self.interrupting = true;
+            return Some(FrontendEffect::Command(UiCommand::Interrupt));
+        }
+        let action_id = match &pending.request.spec {
+            InteractionSpec::Approval(spec) => {
+                let key = match code {
+                    KeyCode::Char(value) => Some(value.to_ascii_lowercase().to_string()),
+                    KeyCode::Esc => Some("escape".into()),
+                    _ => None,
+                };
+                key.and_then(|key| {
+                    spec.actions.iter().find(|action| {
+                        action
+                            .key_hint
+                            .as_ref()
+                            .is_some_and(|hint| hint.eq_ignore_ascii_case(&key))
+                            || (key == "escape" && action.id == "deny")
+                    })
+                })
+                .map(|action| action.id.clone())
+            }
+            InteractionSpec::SingleSelect(spec) => match code {
+                KeyCode::Up => {
+                    pending.selected = pending.selected.saturating_sub(1);
+                    return Some(FrontendEffect::None);
+                }
+                KeyCode::Down => {
+                    pending.selected =
+                        (pending.selected + 1).min(spec.options.len().saturating_sub(1));
+                    return Some(FrontendEffect::None);
+                }
+                KeyCode::Enter => spec
+                    .options
+                    .get(pending.selected)
+                    .map(|option| option.id.clone()),
+                KeyCode::Esc => Some("cancel".into()),
+                _ => None,
+            },
+        };
+        let Some(action_id) = action_id else {
+            return Some(FrontendEffect::None);
+        };
+        let response = InteractionResponse {
+            id: pending.request.id.clone(),
+            owner: pending.request.owner.clone(),
+            generation: pending.request.generation,
+            action_id,
         };
         self.pending = None;
         self.resume_elapsed_timer();
-        Some(FrontendEffect::Command(UiCommand::Approve { id, decision }))
-    }
-
-    fn handle_permissions_key(&mut self, key: KeyEvent) -> Option<FrontendEffect> {
-        let selected = self.permissions_selected?;
-        match key.code {
-            KeyCode::Up => {
-                self.permissions_selected = Some(selected.saturating_sub(1));
-                Some(FrontendEffect::None)
-            }
-            KeyCode::Down => {
-                self.permissions_selected = Some((selected + 1).min(PERMISSION_MODES.len() - 1));
-                Some(FrontendEffect::None)
-            }
-            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                let mode = PERMISSION_MODES[selected].mode;
-                self.permission_mode = mode;
-                self.permissions_selected = None;
-                Some(FrontendEffect::Command(UiCommand::SetPermissionMode(mode)))
-            }
-            _ => Some(FrontendEffect::None),
-        }
+        Some(FrontendEffect::Command(UiCommand::RespondToInteraction(
+            response,
+        )))
     }
 
     fn handle_setting_key(&mut self, key: KeyEvent) -> Option<FrontendEffect> {
@@ -535,12 +516,9 @@ impl FrontendProjection {
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 let allowed = !self.running
-                    || self.selected_slash_command().is_some_and(|command| {
-                        matches!(
-                            command.action,
-                            SlashAction::Permissions | SlashAction::Provider
-                        )
-                    });
+                    || self
+                        .selected_slash_command()
+                        .is_some_and(|command| command.available_while_running);
                 Some(if allowed {
                     self.run_selected_slash_command()
                 } else {
@@ -787,15 +765,6 @@ impl FrontendProjection {
                 self.setting_picker = Some(SettingPicker::Model(selected));
                 FrontendEffect::None
             }
-            SlashAction::Permissions => {
-                self.permissions_selected = Some(
-                    PERMISSION_MODES
-                        .iter()
-                        .position(|option| option.mode == self.permission_mode)
-                        .unwrap_or_default(),
-                );
-                FrontendEffect::None
-            }
             SlashAction::Provider if self.running => {
                 self.show_provider_change_notice();
                 FrontendEffect::None
@@ -862,7 +831,7 @@ impl FrontendProjection {
 
     pub(crate) fn composer_height(&self, width: u16) -> u16 {
         match &self.pending {
-            Some(pending) => permission_height(&pending.request, width),
+            Some(pending) => interaction_height(&pending.request, width),
             None => self.composer.height(width),
         }
     }
@@ -965,15 +934,11 @@ impl FrontendProjection {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    pub(crate) fn permissions_panel_height(&self) -> u16 {
-        let count = if self.permissions_selected.is_some() {
-            PERMISSION_MODES.len()
-        } else {
-            match self.setting_picker {
-                Some(SettingPicker::Effort(_)) => self.effort_options().len(),
-                Some(SettingPicker::Model(_)) => self.model_options().len(),
-                None => 0,
-            }
+    pub(crate) fn settings_panel_height(&self) -> u16 {
+        let count = match self.setting_picker {
+            Some(SettingPicker::Effort(_)) => self.effort_options().len(),
+            Some(SettingPicker::Model(_)) => self.model_options().len(),
+            None => 0,
         };
         u16::try_from(count)
             .unwrap_or(u16::MAX)
@@ -1018,41 +983,10 @@ impl FrontendProjection {
         );
     }
 
-    pub(crate) fn render_permissions_panel(&self, frame: &mut Frame, area: Rect) {
+    pub(crate) fn render_settings_panel(&self, frame: &mut Frame, area: Rect) {
         if let Some(picker) = self.setting_picker {
             self.render_setting_picker(frame, area, picker);
-            return;
         }
-        let Some(selected) = self.permissions_selected else {
-            return;
-        };
-        frame.render_widget(Block::default().style(theme::picker_bg()), area);
-        let lines = PERMISSION_MODES
-            .iter()
-            .enumerate()
-            .map(|(index, option)| {
-                let marker = if index == selected { "› " } else { "  " };
-                let active = permission_mode_indicator(option.mode, self.permission_mode);
-                let style = if index == selected {
-                    theme::picker_selected()
-                } else {
-                    theme::picker_muted()
-                };
-                Line::from(vec![
-                    Span::styled(marker, style),
-                    Span::styled(active, theme::running()),
-                    Span::styled(format!("{:<12}", option.name), style),
-                    Span::styled(option.description, theme::picker_muted()),
-                ])
-            })
-            .collect::<Vec<_>>();
-        let inner = Rect {
-            x: area.x,
-            y: area.y.saturating_add(1),
-            width: area.width,
-            height: area.height.saturating_sub(2),
-        };
-        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn render_setting_picker(&self, frame: &mut Frame, area: Rect, picker: SettingPicker) {
@@ -1098,7 +1032,7 @@ impl FrontendProjection {
 
     pub(crate) fn render_interaction(&mut self, frame: &mut Frame, area: Rect) {
         if let Some(pending) = &self.pending {
-            render_permission(frame, area, &pending.request);
+            render_interaction_spec(frame, area, &pending.request, pending.selected);
         } else {
             let placeholder = if self.quit_confirmation_active() {
                 "Press again to quit"
@@ -1155,9 +1089,27 @@ impl FrontendProjection {
                 self.last_request_usage = usage;
                 self.context_usage_known = true;
             }
-            AgentEvent::PermissionNeeded { id, request } => {
+            AgentEvent::InteractionRequested(request) => {
                 self.pause_elapsed_timer();
-                self.pending = Some(Pending { id, request });
+                let selected = match &request.spec {
+                    InteractionSpec::SingleSelect(spec) => spec
+                        .selected
+                        .as_ref()
+                        .and_then(|id| spec.options.iter().position(|option| &option.id == id))
+                        .unwrap_or_default(),
+                    InteractionSpec::Approval(_) => 0,
+                };
+                self.pending = Some(Pending { request, selected });
+            }
+            AgentEvent::InteractionCancelled { id } => {
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.request.id == id)
+                {
+                    self.pending = None;
+                    self.resume_elapsed_timer();
+                }
             }
             AgentEvent::ExtensionCatalog(catalog) => {
                 self.extensions = catalog;
@@ -1565,7 +1517,6 @@ fn extension_slash_command(descriptor: CommandDescriptor) -> SlashCommand {
     let action = match descriptor.id.as_str() {
         "tokio.builtin:clear" => SlashAction::Clear,
         "tokio.builtin:model" => SlashAction::Model,
-        "tokio.builtin:permissions" => SlashAction::Permissions,
         "tokio.builtin:providers" => SlashAction::Provider,
         "tokio.builtin:extensions" => SlashAction::Extensions,
         _ => SlashAction::Extension(descriptor.id),
@@ -1672,7 +1623,7 @@ fn model_context_window(provider: &str, model: &str) -> Option<u64> {
 
 fn context_before_compaction(provider: &str, window: u64, max_output_tokens: u32) -> u64 {
     if provider == "openai" {
-        window.saturating_mul(9) / 10
+        (window.saturating_mul(9) / 10).min(250_000)
     } else {
         window.saturating_sub(u64::from(max_output_tokens).min(20_000))
     }
@@ -1710,23 +1661,26 @@ fn slash_command_description_width(commands: &[SlashCommand], query: &str) -> us
         .unwrap_or_default()
 }
 
-fn permission_mode_indicator(mode: Mode, active: Mode) -> &'static str {
-    if mode == active { "✓ " } else { "  " }
+fn interaction_height(request: &InteractionRequest, width: u16) -> u16 {
+    let width = usize::from(width.saturating_sub(4).max(1));
+    let rows = interaction_lines(request, 0, width).len();
+    u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(2)
 }
 
-fn permission_height(request: &PermissionRequest, width: u16) -> u16 {
-    let content_width = width.saturating_sub(4).max(1);
-    let (intro, summary, actions) = permission_sections(request, content_width);
-    u16::try_from(intro.len() + summary.len() + actions.len())
-        .unwrap_or(u16::MAX)
-        .saturating_add(4)
-}
-
-fn render_permission(frame: &mut Frame, area: Rect, request: &PermissionRequest) {
+fn render_interaction_spec(
+    frame: &mut Frame,
+    area: Rect,
+    request: &InteractionRequest,
+    selected: usize,
+) {
+    let title = match &request.spec {
+        InteractionSpec::Approval(spec) => &spec.title,
+        InteractionSpec::SingleSelect(spec) => &spec.title,
+    };
     let block = Block::default()
         .title(Line::from(vec![
             Span::styled(" ◆ ", theme::approval()),
-            Span::styled("Permission required ", theme::bold()),
+            Span::styled(format!("{title} "), theme::bold()),
         ]))
         .borders(Borders::ALL)
         .border_style(theme::approval())
@@ -1734,102 +1688,78 @@ fn render_permission(frame: &mut Frame, area: Rect, request: &PermissionRequest)
         .style(theme::composer_bg());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
+    if inner.width > 0 && inner.height > 0 {
+        frame.render_widget(
+            Paragraph::new(interaction_lines(
+                request,
+                selected,
+                usize::from(inner.width),
+            )),
+            inner,
+        );
     }
-
-    let (intro, summary, actions) = permission_sections(request, inner.width);
-    let intro_rows = u16::try_from(intro.len()).unwrap_or(u16::MAX);
-    let summary_rows = u16::try_from(summary.len()).unwrap_or(u16::MAX);
-    let action_rows = u16::try_from(actions.len()).unwrap_or(u16::MAX);
-    let intro_area = Rect {
-        x: inner.x,
-        y: inner.y,
-        width: inner.width,
-        height: intro_rows,
-    };
-    let summary_area = Rect {
-        x: inner.x,
-        y: inner.y.saturating_add(intro_rows).saturating_add(1),
-        width: inner.width,
-        height: summary_rows,
-    };
-    let action_area = Rect {
-        x: inner.x,
-        y: inner.bottom().saturating_sub(action_rows),
-        width: inner.width,
-        height: action_rows,
-    };
-    frame.render_widget(Paragraph::new(intro), intro_area);
-    frame.render_widget(Paragraph::new(summary), summary_area);
-    frame.render_widget(Paragraph::new(actions), action_area);
 }
 
-fn permission_sections(
-    request: &PermissionRequest,
-    width: u16,
-) -> (Vec<Line<'static>>, Vec<Line<'static>>, Vec<Line<'static>>) {
-    let width = usize::from(width.max(1));
-    let verb = match request.action {
-        Action::Read => "read data",
-        Action::Edit => "make changes",
-        Action::Execute => "run a command",
-    };
-    let intro = wrap_permission_text(
-        &format!("The agent wants to {verb} using {}:", request.tool),
-        width,
-        usize::MAX,
-    )
-    .into_iter()
-    .map(Line::from)
-    .collect();
-    let summary = wrap_permission_text(&request.summary, width, 3)
-        .into_iter()
-        .map(|line| Line::styled(line, theme::code()))
-        .collect();
-    let actions = if width >= 76 {
-        vec![permission_action_line(&[
-            ("Y", "Allow once"),
-            ("A", "Allow for session"),
-            ("N", "Deny"),
-            ("C", "Copy details"),
-        ])]
-    } else if width >= 30 {
-        vec![
-            permission_action_line(&[("Y", "Allow once"), ("A", "Session")]),
-            permission_action_line(&[("N", "Deny"), ("C", "Copy")]),
-        ]
-    } else {
-        [
-            ("Y", "Allow once"),
-            ("A", "Allow for session"),
-            ("N", "Deny"),
-            ("C", "Copy details"),
-        ]
-        .into_iter()
-        .map(|action| permission_action_line(&[action]))
-        .collect()
-    };
-    (intro, summary, actions)
-}
-
-fn permission_action_line(actions: &[(&str, &str)]) -> Line<'static> {
-    let mut spans = Vec::new();
-    for (index, (key, label)) in actions.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::raw("   "));
+fn interaction_lines(
+    request: &InteractionRequest,
+    selected: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    match &request.spec {
+        InteractionSpec::Approval(spec) => {
+            let mut lines = Vec::new();
+            for section in &spec.body {
+                if let Some(heading) = &section.heading {
+                    lines.push(Line::styled(heading.clone(), theme::bold()));
+                }
+                lines.extend(
+                    wrap_interaction_text(&section.text, width, 3)
+                        .into_iter()
+                        .map(|line| Line::styled(line, theme::code())),
+                );
+            }
+            let mut actions = Vec::new();
+            for action in &spec.actions {
+                if !actions.is_empty() {
+                    actions.push(Span::raw("   "));
+                }
+                let key = action.key_hint.as_deref().unwrap_or("Enter");
+                actions.push(Span::styled(format!(" {key} "), theme::key()));
+                actions.push(Span::raw(format!(" {}", action.label)));
+            }
+            if spec.copy_text.is_some() {
+                actions.push(Span::raw("   "));
+                actions.push(Span::styled(" C ", theme::key()));
+                actions.push(Span::raw(" Copy"));
+            }
+            lines.push(Line::from(actions));
+            lines
         }
-        spans.push(Span::styled(format!(" {key} "), theme::key()));
-        spans.push(Span::raw(format!(" {label}")));
+        InteractionSpec::SingleSelect(spec) => spec
+            .options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                let style = if index == selected {
+                    theme::picker_selected()
+                } else {
+                    theme::picker_muted()
+                };
+                let mut spans = vec![
+                    Span::styled(if index == selected { "› " } else { "  " }, style),
+                    Span::styled(option.label.clone(), style),
+                ];
+                if let Some(description) = &option.description {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(description.clone(), theme::picker_muted()));
+                }
+                Line::from(spans)
+            })
+            .collect(),
     }
-    Line::from(spans)
 }
 
-fn permission_copy_text(request: &PermissionRequest) -> String {
-    format!("{}: {}", request.tool, request.summary)
-}
-
-fn wrap_permission_text(text: &str, width: usize, max_rows: usize) -> Vec<String> {
+fn wrap_interaction_text(text: &str, width: usize, max_rows: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = Vec::new();
     for source_line in text.lines() {
@@ -2023,11 +1953,6 @@ mod tests {
                 "Run a prompt repeatedly on an interval",
             ),
             (
-                "tokio.builtin:permissions",
-                "/permissions",
-                "Select how the agent asks for permission",
-            ),
-            (
                 "tokio.builtin:providers",
                 "/providers",
                 "Connect or switch AI providers",
@@ -2057,7 +1982,6 @@ mod tests {
             String::new(),
             None,
             0,
-            Mode::Suggest,
             Vec::new(),
             builtin_descriptors(),
             Vec::new(),
@@ -2244,7 +2168,6 @@ mod tests {
             String::new(),
             None,
             0,
-            Mode::Suggest,
             builtin_descriptors(),
             vec![extension(false)],
         );
@@ -2368,10 +2291,6 @@ mod tests {
         assert!(projection.extension_manager.is_none());
         assert!(!projection.extension_details_visible);
 
-        projection.permissions_selected = Some(0);
-        assert!(matches!(projection.on_key(ctrl_c), FrontendEffect::None));
-        assert!(projection.permissions_selected.is_none());
-
         projection.setting_picker = Some(SettingPicker::Model(0));
         assert!(matches!(projection.on_key(ctrl_c), FrontendEffect::None));
         assert!(projection.setting_picker.is_none());
@@ -2485,15 +2404,19 @@ mod tests {
         assert_eq!(context_meter(None, 10, true), "──────── N/A");
         assert_eq!(
             context_before_compaction("openai", 372_000, 32_000),
-            334_800
+            250_000
+        );
+        assert_eq!(
+            context_before_compaction("openai", 272_000, 32_000),
+            244_800
         );
         assert_eq!(
             context_before_compaction("anthropic", 1_000_000, 32_000),
             980_000
         );
         assert_eq!(
-            context_meter(Some(334_800), 334_800, true),
-            "━━━━━━━━ 100% (334.8k tokens)"
+            context_meter(Some(250_000), 250_000, true),
+            "━━━━━━━━ 100% (250k tokens)"
         );
     }
 
@@ -2960,18 +2883,6 @@ mod tests {
     }
 
     #[test]
-    fn active_permission_indicator_has_a_fixed_leading_column() {
-        assert_eq!(
-            permission_mode_indicator(Mode::Suggest, Mode::Suggest),
-            "✓ "
-        );
-        assert_eq!(
-            permission_mode_indicator(Mode::AutoEdit, Mode::Suggest),
-            "  "
-        );
-    }
-
-    #[test]
     fn provider_session_update_preserves_rendered_conversation() {
         let mut projection = projection();
         projection.begin_turn("keep this visible");
@@ -2989,7 +2900,6 @@ mod tests {
             "/tmp".into(),
             Some(300_000),
             8_192,
-            Mode::FullAuto,
             builtin_descriptors(),
             Vec::new(),
         );
@@ -3123,7 +3033,7 @@ mod tests {
             projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             FrontendEffect::Command(UiCommand::SetModel(model)) if model == "deepseek-v4-pro"
         ));
-        assert_eq!(projection.permissions_panel_height(), 4);
+        assert_eq!(projection.settings_panel_height(), 4);
 
         projection.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert!(matches!(
@@ -3155,38 +3065,10 @@ mod tests {
     }
 
     #[test]
-    fn permissions_command_selects_a_new_runtime_mode() {
-        let mut projection = projection();
-        projection.composer.replace("/permissions");
-
-        assert!(matches!(
-            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            FrontendEffect::None
-        ));
-        assert_eq!(projection.permissions_panel_height(), 5);
-
-        projection.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert!(matches!(
-            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            FrontendEffect::Command(UiCommand::SetPermissionMode(Mode::AutoEdit))
-        ));
-        assert_eq!(projection.permission_mode, Mode::AutoEdit);
-        assert_eq!(projection.permissions_panel_height(), 0);
-    }
-
-    #[test]
     fn configuration_slash_commands_remain_available_while_running() {
         let mut projection = projection();
         projection.running = true;
 
-        projection.composer.replace("/permissions");
-        assert!(matches!(
-            projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            FrontendEffect::None
-        ));
-        assert_eq!(projection.permissions_panel_height(), 5);
-
-        projection.permissions_selected = None;
         projection.composer.replace("/providers");
         assert!(matches!(
             projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -3205,19 +3087,6 @@ mod tests {
             projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             FrontendEffect::None
         ));
-    }
-
-    #[test]
-    fn permissions_picker_can_be_cancelled_without_changing_mode() {
-        let mut projection = projection();
-        projection.composer.replace("/permissions");
-        projection.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        projection.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-
-        projection.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-        assert_eq!(projection.permission_mode, Mode::Suggest);
-        assert_eq!(projection.permissions_panel_height(), 0);
     }
 
     #[test]
@@ -3324,7 +3193,6 @@ mod tests {
             String::new(),
             None,
             0,
-            Mode::Suggest,
             vec![
                 "from another directory".to_owned(),
                 "most recent".to_owned(),
@@ -3340,37 +3208,40 @@ mod tests {
     }
 
     #[test]
-    fn permission_panel_grows_for_details_but_stays_compact() {
-        let mut request = PermissionRequest {
-            tool: "bash".into(),
-            summary: "run: cargo test".into(),
-            action: Action::Execute,
+    fn generic_interactions_use_opaque_ids_and_extension_actions() {
+        let mut projection = projection();
+        let request = InteractionRequest {
+            id: tokio_agent_extension_api::InteractionId::new("opaque-7"),
+            owner: tokio_agent_extension_api::ExtensionId::new("example.gate"),
+            generation: 3,
+            spec: InteractionSpec::Approval(tokio_agent_extension_api::ApprovalSpec {
+                title: "Confirm operation".into(),
+                body: vec![tokio_agent_extension_api::TextSection {
+                    heading: None,
+                    text: "safe text".into(),
+                }],
+                actions: vec![tokio_agent_extension_api::InteractionAction {
+                    id: "proceed".into(),
+                    label: "Proceed".into(),
+                    key_hint: Some("p".into()),
+                    tone: tokio_agent_extension_api::InteractionTone::Primary,
+                }],
+                copy_text: Some("copy only".into()),
+            }),
         };
-        assert_eq!(permission_height(&request, 80), 7);
-
-        request.summary = "x".repeat(200);
-        let height = permission_height(&request, 40);
-        assert!(height > 7);
-        let (_, _, actions) = permission_sections(&request, 36);
-        let rendered = actions
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("Y"));
-        assert!(rendered.contains("A"));
-        assert!(rendered.contains("N"));
-        assert!(rendered.contains("C"));
-    }
-
-    #[test]
-    fn permission_details_can_be_copied_without_answering() {
-        let request = PermissionRequest {
-            tool: "bash".into(),
-            summary: "cargo test".into(),
-            action: Action::Execute,
-        };
-
-        assert_eq!(permission_copy_text(&request), "bash: cargo test");
+        projection.apply(AgentEvent::InteractionRequested(request));
+        assert!(
+            matches!(projection.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)), FrontendEffect::Copy(text) if text == "copy only")
+        );
+        assert!(
+            projection.pending.is_some(),
+            "copy must not resolve the interaction"
+        );
+        assert!(
+            matches!(projection.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            FrontendEffect::Command(UiCommand::RespondToInteraction(response))
+                if response.id.as_str() == "opaque-7" && response.action_id == "proceed" && response.generation == 3)
+        );
+        assert!(projection.pending.is_none());
     }
 }

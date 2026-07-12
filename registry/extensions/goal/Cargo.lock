@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "tokio-goal"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "serde_json",
  "tokio-agent-extension-api",

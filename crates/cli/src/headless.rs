@@ -5,7 +5,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_agent_core::agent::AgentError;
 use tokio_agent_core::agent::{AgentEvent, UiCommand};
 use tokio_agent_core::message::ToolOutput;
-use tokio_agent_core::permission::Decision;
 
 pub struct Printer {
     text_open: bool,
@@ -99,17 +98,21 @@ impl Printer {
                     Err(error) => Err(AgentError::Command(error)),
                 });
             }
-            AgentEvent::PermissionNeeded { id, request } => {
+            AgentEvent::InteractionRequested(request) => {
                 self.end_text();
                 eprintln!(
-                    "\x1b[33m[denied] {} would {} — set permission_mode = \"full-auto\" to allow\x1b[0m",
-                    request.tool, request.summary
+                    "\x1b[33m[denied] this extension interaction requires an interactive frontend\x1b[0m"
                 );
-                let _ = commands.send(UiCommand::Approve {
-                    id,
-                    decision: Decision::Deny,
-                });
+                let _ = commands.send(UiCommand::RespondToInteraction(
+                    tokio_agent_extension_api::InteractionResponse {
+                        id: request.id,
+                        owner: request.owner,
+                        generation: request.generation,
+                        action_id: "cancel".into(),
+                    },
+                ));
             }
+            AgentEvent::InteractionCancelled { .. } => {}
             AgentEvent::TurnDone(result) => {
                 self.end_text();
                 return Some(result);

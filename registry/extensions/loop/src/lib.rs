@@ -28,6 +28,24 @@ static STATE: Mutex<State> = Mutex::new(State {
 
 struct Loop;
 impl Guest for Loop {
+    fn authorize_tool(_handler: String, _invocation_json: String) -> String {
+        r#"{"decision":"deny","reason":"loop is not a tool gate","actions":[]}"#.into()
+    }
+    fn on_interaction_response(
+        _handler: String,
+        _invocation_id: String,
+        _response_json: String,
+    ) -> String {
+        r#"{"decision":"deny","reason":"loop has no interactions","actions":[]}"#.into()
+    }
+    fn load_state(
+        _user_state: Vec<u8>,
+        session_state: Vec<u8>,
+        _settings_json: String,
+        _startup_settings_json: String,
+    ) {
+        Self::restore_session_state(session_state);
+    }
     fn on_command(_handler: String, arguments: String) -> String {
         let mut state = STATE.lock().expect("loop state");
         let argument = arguments.trim();

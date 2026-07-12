@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 const DEFAULT_REASONING_EFFORT: &str = "medium";
-const DEFAULT_PERMISSION_MODE: &str = "suggest";
 const DEFAULT_BASH_YIELD_TIME_MS: u64 = 10_000;
 const DEFAULT_BASH_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
 const MAX_RECENT_MESSAGES: usize = 100;
@@ -42,8 +41,6 @@ pub enum ConfigError {
     UnknownProvider(String),
     #[error("unknown auth '{0}' — use \"chatgpt\" or \"api_key\"")]
     UnknownAuth(String),
-    #[error("unknown permission_mode '{0}'")]
-    UnknownPermissionMode(String),
     #[error("bash_timeout_ms must be greater than zero")]
     InvalidBashTimeout,
 }
@@ -72,24 +69,6 @@ pub enum AuthKind {
     ApiKey,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PermissionMode {
-    Suggest,
-    AutoEdit,
-    FullAuto,
-}
-
-impl PermissionMode {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Suggest => "suggest",
-            Self::AutoEdit => "auto-edit",
-            Self::FullAuto => "full-auto",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub provider: ProviderKind,
@@ -99,7 +78,7 @@ pub struct ResolvedConfig {
     pub max_tokens: u32,
     pub context_window_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
-    pub permission_mode: PermissionMode,
+    pub extensions: BTreeMap<String, toml::Value>,
     pub system_prompt: Option<String>,
     pub bash_yield_time_ms: u64,
     pub bash_timeout_ms: u64,
@@ -115,10 +94,27 @@ struct Layer {
     max_tokens: Option<u32>,
     context_window_tokens: Option<u64>,
     reasoning_effort: Option<String>,
-    permission_mode: Option<String>,
+    #[serde(default)]
+    extensions: BTreeMap<String, toml::Value>,
     system_prompt: Option<String>,
     bash_yield_time_ms: Option<u64>,
     bash_timeout_ms: Option<u64>,
+}
+
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_toml(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
 }
 
 impl Layer {
@@ -144,8 +140,13 @@ impl Layer {
         if other.reasoning_effort.is_some() {
             self.reasoning_effort = other.reasoning_effort;
         }
-        if other.permission_mode.is_some() {
-            self.permission_mode = other.permission_mode;
+        for (id, value) in other.extensions {
+            match self.extensions.get_mut(&id) {
+                Some(existing) => merge_toml(existing, value),
+                None => {
+                    self.extensions.insert(id, value);
+                }
+            }
         }
         if other.system_prompt.is_some() {
             self.system_prompt = other.system_prompt;
@@ -168,7 +169,7 @@ pub struct Config {
     pub max_tokens: u32,
     pub context_window_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
-    pub permission_mode: String,
+    pub extensions: BTreeMap<String, toml::Value>,
     pub system_prompt: Option<String>,
     pub bash_yield_time_ms: u64,
     pub bash_timeout_ms: u64,
@@ -217,9 +218,7 @@ impl Config {
                     .reasoning_effort
                     .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_owned()),
             ),
-            permission_mode: layer
-                .permission_mode
-                .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_owned()),
+            extensions: layer.extensions,
             system_prompt: layer.system_prompt,
             bash_yield_time_ms: layer
                 .bash_yield_time_ms
@@ -248,12 +247,6 @@ impl Config {
             Some(other) => return Err(ConfigError::UnknownAuth(other.to_owned())),
             None => None,
         };
-        let permission_mode = match self.permission_mode.as_str() {
-            "suggest" => PermissionMode::Suggest,
-            "auto-edit" | "auto_edit" => PermissionMode::AutoEdit,
-            "full-auto" | "full_auto" => PermissionMode::FullAuto,
-            other => return Err(ConfigError::UnknownPermissionMode(other.to_owned())),
-        };
         let context_window_tokens = self
             .context_window_tokens
             .or_else(|| known_context_window(provider, &self.model));
@@ -268,7 +261,7 @@ impl Config {
                 self.reasoning_effort
                     .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_owned()),
             ),
-            permission_mode,
+            extensions: self.extensions,
             system_prompt: self.system_prompt,
             bash_yield_time_ms: self.bash_yield_time_ms.clamp(250, 30_000),
             bash_timeout_ms: self.bash_timeout_ms,
@@ -317,14 +310,6 @@ fn store_provider_selection_at(
         reasoning_effort: reasoning_effort.map(str::to_owned),
     };
     write_selection(path, &selection)
-}
-
-pub fn store_permission_mode(mode: PermissionMode) -> Result<(), ConfigError> {
-    let path = runtime_config_path().ok_or_else(|| ConfigError::Write {
-        path: PathBuf::from("runtime.toml"),
-        source: std::io::Error::other("configuration directory is unavailable"),
-    })?;
-    store_permission_mode_at(&path, mode)
 }
 
 pub fn recent_messages() -> Result<Vec<String>, ConfigError> {
@@ -461,15 +446,6 @@ fn ensure_parent(path: &Path) -> Result<(), ConfigError> {
         })?;
     }
     Ok(())
-}
-
-fn store_permission_mode_at(path: &Path, mode: PermissionMode) -> Result<(), ConfigError> {
-    ensure_parent(path)?;
-    let text = format!("permission_mode = {:?}\n", mode.as_str());
-    std::fs::write(path, text).map_err(|source| ConfigError::Write {
-        path: path.to_owned(),
-        source,
-    })
 }
 
 fn recent_messages_at(path: &Path) -> Result<Vec<String>, ConfigError> {
@@ -698,7 +674,7 @@ mod tests {
             max_tokens: 42,
             context_window_tokens: None,
             reasoning_effort: None,
-            permission_mode: "auto-edit".into(),
+            extensions: BTreeMap::new(),
             system_prompt: None,
             bash_yield_time_ms: DEFAULT_BASH_YIELD_TIME_MS,
             bash_timeout_ms: DEFAULT_BASH_TIMEOUT_MS,
@@ -706,7 +682,7 @@ mod tests {
         let resolved = config.resolve().unwrap();
         assert_eq!(resolved.provider, ProviderKind::OpenAi);
         assert_eq!(resolved.auth, Some(AuthKind::ChatGpt));
-        assert_eq!(resolved.permission_mode, PermissionMode::AutoEdit);
+        assert!(resolved.extensions.is_empty());
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
     }
 
@@ -800,14 +776,23 @@ mod tests {
     }
 
     #[test]
-    fn selected_permission_mode_round_trips_as_a_config_layer() {
-        let path = temp_path("runtime.toml");
-
-        store_permission_mode_at(&path, PermissionMode::FullAuto).unwrap();
-        let layer = read_layer(&path).unwrap().unwrap();
-
-        assert_eq!(layer.permission_mode.as_deref(), Some("full-auto"));
+    fn removed_permission_mode_is_rejected_as_unknown() {
+        let path = temp_path("removed-permission.toml");
+        std::fs::write(&path, "permission_mode = \"suggest\"\n").unwrap();
+        assert!(matches!(read_layer(&path), Err(ConfigError::Parse { .. })));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn extension_tables_merge_by_key() {
+        let mut base: Layer =
+            toml::from_str("[extensions.\"tokio.permissions\"]\nmode = \"suggest\"\n").unwrap();
+        let overlay: Layer =
+            toml::from_str("[extensions.\"tokio.permissions\"]\nextra = true\n").unwrap();
+        base.merge(overlay);
+        let table = base.extensions["tokio.permissions"].as_table().unwrap();
+        assert_eq!(table["mode"].as_str(), Some("suggest"));
+        assert_eq!(table["extra"].as_bool(), Some(true));
     }
 
     #[test]

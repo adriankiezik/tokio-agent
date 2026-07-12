@@ -12,6 +12,15 @@ world extension {
     /// `content: string` and `is_error: bool`.
     export on-tool: func(handler: string, arguments-json: string) -> string;
 
+    /// Authorizes a tool invocation. The request and response use host API JSON DTOs.
+    export authorize-tool: func(handler: string, invocation-json: string) -> string;
+
+    /// Completes an interaction without keeping the authorization callback open.
+    export on-interaction-response: func(handler: string, invocation-id: string, response-json: string) -> string;
+
+    /// Restores extension-owned user and session state plus merged settings.
+    export load-state: func(user-state: list<u8>, session-state: list<u8>, settings-json: string, startup-settings-json: string);
+
     /// Restores the last host-validated opaque session state after a companion restart.
     export restore-session-state: func(state: list<u8>);
 }

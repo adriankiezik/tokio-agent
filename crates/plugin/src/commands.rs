@@ -5,7 +5,6 @@ use crate::{CatalogError, CommandCatalog, PromptCommand};
 
 pub const CLEAR_COMMAND_ID: &str = "tokio.builtin:clear";
 pub const MODEL_COMMAND_ID: &str = "tokio.builtin:model";
-pub const PERMISSIONS_COMMAND_ID: &str = "tokio.builtin:permissions";
 pub const PROVIDERS_COMMAND_ID: &str = "tokio.builtin:providers";
 pub const EXTENSIONS_COMMAND_ID: &str = "tokio.builtin:extensions";
 
@@ -23,13 +22,6 @@ pub fn builtin_command_catalog() -> Vec<CommandDescriptor> {
             MODEL_COMMAND_ID,
             "/model",
             "Switch models for this session",
-            None,
-            true,
-        ),
-        (
-            PERMISSIONS_COMMAND_ID,
-            "/permissions",
-            "Select how the agent asks for permission",
             None,
             true,
         ),
@@ -66,7 +58,6 @@ pub fn builtin_command_catalog() -> Vec<CommandDescriptor> {
 pub enum BuiltInCommand {
     Clear,
     OpenModelPicker,
-    OpenPermissionsPicker,
     OpenProviderPicker,
     OpenExtensionManager,
 }
@@ -76,15 +67,9 @@ pub enum RoutedCommand {
     SubmitMessage(String),
     SubmitPrompt(String),
     BuiltIn(BuiltInCommand),
-    Extension {
-        id: CommandId,
-        arguments: String,
-    },
+    Extension { id: CommandId, arguments: String },
     Interrupt,
-    Approve {
-        id: u64,
-        decision: tokio_agent_extension_api::ApprovalDecision,
-    },
+    RespondToInteraction(tokio_agent_extension_api::InteractionResponse),
     Shutdown,
 }
 
@@ -138,7 +123,9 @@ impl CommandRouter {
         match command {
             SessionCommand::SubmitMessage(text) => Ok(RoutedCommand::SubmitMessage(text)),
             SessionCommand::Interrupt => Ok(RoutedCommand::Interrupt),
-            SessionCommand::Approve { id, decision } => Ok(RoutedCommand::Approve { id, decision }),
+            SessionCommand::RespondToInteraction(response) => {
+                Ok(RoutedCommand::RespondToInteraction(response))
+            }
             SessionCommand::Shutdown => Ok(RoutedCommand::Shutdown),
             SessionCommand::InvokeCommand { id, arguments } => {
                 if let Some(prompt) = self.catalog.invoke(&id, &arguments, cwd)? {
@@ -160,7 +147,6 @@ fn route_builtin(id: &str) -> Result<BuiltInCommand, RouteError> {
     let command = match id {
         CLEAR_COMMAND_ID => BuiltInCommand::Clear,
         MODEL_COMMAND_ID => BuiltInCommand::OpenModelPicker,
-        PERMISSIONS_COMMAND_ID => BuiltInCommand::OpenPermissionsPicker,
         PROVIDERS_COMMAND_ID => BuiltInCommand::OpenProviderPicker,
         EXTENSIONS_COMMAND_ID => BuiltInCommand::OpenExtensionManager,
         _ => return Err(CatalogError::Unknown(id.to_owned()).into()),

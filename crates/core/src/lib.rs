@@ -2,7 +2,6 @@ pub mod agent;
 pub mod context;
 pub mod event;
 pub mod message;
-pub mod permission;
 pub mod provider;
 mod sleep;
 pub mod tool;
@@ -14,7 +13,10 @@ pub use agent::{
 pub use context::ContextAssembler;
 pub use event::Event;
 pub use message::{ContentBlock, Message, ProviderMetadata, Role};
-pub use permission::{Decision, Mode, Outcome, PermissionEngine, PermissionId};
 pub use provider::{Capabilities, Provider, ProviderError, Request};
-pub use tool::{Action, PermissionRequest, Tool, ToolCtx, ToolDef, ToolResult};
+pub use tool::{
+    FrontendCapabilities, InteractionBroker, InteractionRequest, InteractionResponse, Tool,
+    ToolCtx, ToolDef, ToolEffect, ToolGate, ToolGateResult, ToolGateSlot, ToolGateState,
+    ToolInvocation, ToolOwner, ToolResult,
+};
 pub use tool_execution::{DynamicToolCatalog, DynamicToolError};

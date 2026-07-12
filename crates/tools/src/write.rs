@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_agent_core::provider::BoxFuture;
-use tokio_agent_core::tool::{Action, PermissionRequest, Tool, ToolCtx, ToolDef, ToolResult};
+use tokio_agent_core::tool::{Tool, ToolCtx, ToolDef, ToolEffect, ToolResult};
 
 use crate::fs::{display_path, resolve, write_file};
 
@@ -32,16 +32,15 @@ impl Tool for Write {
         }
     }
 
-    fn permission(&self, input: &Value) -> PermissionRequest {
-        let path = input
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Edit
+    }
+
+    fn summary(&self, input: &Value) -> Option<String> {
+        input
             .get("path")
             .and_then(Value::as_str)
-            .unwrap_or("<missing>");
-        PermissionRequest {
-            tool: "write".to_owned(),
-            summary: format!("write {path}"),
-            action: Action::Edit,
-        }
+            .map(|value| format!("write {value}"))
     }
 
     fn run<'a>(&'a self, input: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {

@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::fmt::Write;
 use tokio::io::AsyncBufReadExt;
 use tokio_agent_core::provider::BoxFuture;
-use tokio_agent_core::tool::{Action, PermissionRequest, Tool, ToolCtx, ToolDef, ToolResult};
+use tokio_agent_core::tool::{Tool, ToolCtx, ToolDef, ToolEffect, ToolResult};
 
 use crate::fs::resolve;
 
@@ -38,16 +38,15 @@ impl Tool for Read {
         }
     }
 
-    fn permission(&self, input: &Value) -> PermissionRequest {
-        let path = input
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Read
+    }
+
+    fn summary(&self, input: &Value) -> Option<String> {
+        input
             .get("path")
             .and_then(Value::as_str)
-            .unwrap_or("<missing>");
-        PermissionRequest {
-            tool: "read".to_owned(),
-            summary: format!("read {path}"),
-            action: Action::Read,
-        }
+            .map(|value| format!("read {value}"))
     }
 
     fn run<'a>(&'a self, input: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {

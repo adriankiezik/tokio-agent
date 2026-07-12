@@ -1,0 +1,33 @@
+manifest_version = 1
+id = "tokio.permissions"
+name = "Permissions"
+version = "1.0.0"
+description = "Ask before selected tool actions and manage approval policy"
+license = "MIT"
+host_api = ">=1.0, <2.0"
+
+[runtime]
+component = "component/extension.wasm"
+
+[[commands]]
+name = "permissions"
+description = "Select how the agent asks before tool actions"
+handler = "permissions_command"
+available_while_running = true
+
+[tool_gate]
+handler = "authorize_tool"
+interaction_handler = "on_interaction_response"
+
+[[cli_options]]
+long = "permission-mode"
+value_name = "MODE"
+values = ["suggest", "auto-edit", "full-auto"]
+description = "Set the tool approval mode for this session"
+handler = "permission_mode_option"
+
+[capabilities]
+tool_gate = true
+interaction_request = true
+storage_user = true
+storage_session = true

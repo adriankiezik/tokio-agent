@@ -7,7 +7,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_agent_core::provider::BoxFuture;
-use tokio_agent_core::tool::{Action, PermissionRequest, Tool, ToolCtx, ToolDef, ToolResult};
+use tokio_agent_core::tool::{Tool, ToolCtx, ToolDef, ToolEffect, ToolResult};
 
 const EXA_ENDPOINT: &str = "https://mcp.exa.ai/mcp";
 const PARALLEL_ENDPOINT: &str = "https://search.parallel.ai/mcp";
@@ -270,16 +270,15 @@ impl Tool for WebSearch {
         }
     }
 
-    fn permission(&self, input: &Value) -> PermissionRequest {
-        let query = input
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Read
+    }
+
+    fn summary(&self, input: &Value) -> Option<String> {
+        input
             .get("query")
             .and_then(Value::as_str)
-            .unwrap_or("<missing>");
-        PermissionRequest {
-            tool: "websearch".to_owned(),
-            summary: format!("search web for {query}"),
-            action: Action::Read,
-        }
+            .map(|value| format!("search web for {value}"))
     }
 
     fn run<'a>(&'a self, input: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {

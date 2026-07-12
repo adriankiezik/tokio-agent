@@ -3,7 +3,7 @@ mod headless;
 mod session;
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Arg, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
 
@@ -27,12 +27,6 @@ struct Cli {
 
     #[arg(long)]
     debug: bool,
-
-    #[arg(
-        long,
-        help = "Allow all tool actions without permission prompts (dangerous)"
-    )]
-    yolo: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,8 +132,75 @@ struct AliasArgs {
     project: bool,
 }
 
+fn privileged_capability_warning(
+    capabilities: &std::collections::BTreeSet<tokio_agent_extension_api::Capability>,
+) -> &'static str {
+    if capabilities.contains(&tokio_agent_extension_api::Capability::ToolGate) {
+        "; WARNING: tool_gate grants global authority to allow or deny every tool invocation"
+    } else {
+        ""
+    }
+}
+
+fn parse_cli() -> anyhow::Result<Cli> {
+    let raw: Vec<String> = std::env::args().collect();
+    let management = raw
+        .iter()
+        .skip(1)
+        .any(|arg| matches!(arg.as_str(), "login" | "logout" | "extension" | "registry"));
+    if management {
+        return Ok(Cli::parse_from(raw));
+    }
+    let options = session::extension_cli_options(&std::env::current_dir()?)?;
+    let mut command = Cli::command();
+    let builtins: std::collections::BTreeSet<String> = command
+        .get_arguments()
+        .filter_map(|arg| arg.get_long().map(str::to_owned))
+        .collect();
+    let mut owners = std::collections::BTreeMap::new();
+    for (id, option) in &options {
+        if builtins.contains(&option.long)
+            || owners.insert(option.long.clone(), id.clone()).is_some()
+        {
+            anyhow::bail!(
+                "extension CLI option `--{}` conflicts with another option",
+                option.long
+            );
+        }
+        let name: &'static str = Box::leak(option.long.clone().into_boxed_str());
+        let help: &'static str = Box::leak(option.description.clone().into_boxed_str());
+        let value_name: &'static str = Box::leak(option.value_name.clone().into_boxed_str());
+        let values: Vec<&'static str> = option
+            .values
+            .iter()
+            .cloned()
+            .map(|value| Box::leak(value.into_boxed_str()) as &'static str)
+            .collect();
+        command = command.arg(
+            Arg::new(name)
+                .long(name)
+                .help(help)
+                .value_name(value_name)
+                .value_parser(clap::builder::PossibleValuesParser::new(values)),
+        );
+    }
+    let mut matches = match command.try_get_matches_from(raw) {
+        Ok(matches) => matches,
+        Err(error) => error.exit(),
+    };
+    let mut startup: std::collections::BTreeMap<String, serde_json::Value> = Default::default();
+    for (id, option) in options {
+        if let Some(value) = matches.get_one::<String>(&option.long) {
+            startup.entry(id).or_insert_with(|| serde_json::json!({}))[&option.long] =
+                serde_json::Value::String(value.clone());
+        }
+    }
+    session::set_startup_extension_settings(startup);
+    Ok(Cli::from_arg_matches_mut(&mut matches)?)
+}
+
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli()?;
 
     if cli.debug {
         tracing_subscriber::fmt()
@@ -152,8 +213,8 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Logout) => run_logout(),
         Some(Command::Extension(command)) => run_extension(command),
         None => match cli.non_interactive {
-            Some(prompt) => run_headless(prompt, cli.yolo),
-            None => run_tui(cli.yolo),
+            Some(prompt) => run_headless(prompt),
+            None => run_tui(),
         },
     }
 }
@@ -269,9 +330,10 @@ fn run_extension(command: ExtensionCommand) -> anyhow::Result<()> {
             let capabilities = manifest.capabilities.as_set();
             if !capabilities.is_empty() && !args.approve {
                 anyhow::bail!(
-                    "{} requests capabilities {:?}; review them and rerun with --approve",
+                    "{} requests capabilities {:?}{}; review them and rerun with --approve",
                     manifest.id,
-                    capabilities
+                    capabilities,
+                    privileged_capability_warning(&capabilities)
                 );
             }
             let linked = std::fs::canonicalize(&args.path).context("resolving extension path")?;
@@ -572,9 +634,10 @@ fn install_registry_extension(args: InstallArgs) -> anyhow::Result<()> {
     let already_approved = user_config.grant_matches(&grant);
     if !package.capabilities.is_empty() && !args.approve && !already_approved {
         anyhow::bail!(
-            "{} requests capabilities {:?}; review them and rerun with --approve",
+            "{} requests capabilities {:?}{}; review them and rerun with --approve",
             package.id,
-            package.capabilities
+            package.capabilities,
+            privileged_capability_warning(&package.capabilities)
         );
     }
     let archive = http_get(&package.artifact_url)?;
@@ -1060,9 +1123,15 @@ fn run_logout() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_headless(prompt: String, yolo: bool) -> anyhow::Result<()> {
+fn run_headless(prompt: String) -> anyhow::Result<()> {
     let cwd = headless::cwd();
-    let agent = session::build_session(&cwd, yolo)?;
+    let agent = session::build_session(&cwd)?.with_frontend_capabilities(
+        tokio_agent_core::FrontendCapabilities {
+            interactive: false,
+            copy: false,
+            interaction_kinds: Vec::new(),
+        },
+    );
     let initial_command = if prompt.starts_with('/') {
         let (name, arguments) = prompt
             .split_once(char::is_whitespace)
@@ -1104,7 +1173,7 @@ fn run_headless(prompt: String, yolo: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_tui(yolo: bool) -> anyhow::Result<()> {
+fn run_tui() -> anyhow::Result<()> {
     let mut tui = tokio_agent_tui::Tui::new().context("starting the terminal UI")?;
     std::thread::spawn(|| {
         if let Err(error) = load_registry_catalog(true) {
@@ -1113,7 +1182,7 @@ fn run_tui(yolo: bool) -> anyhow::Result<()> {
     });
     let cwd = headless::cwd();
     let mut agent = loop {
-        match session::build_session(&cwd, yolo) {
+        match session::build_session(&cwd) {
             Ok(agent) => break agent,
             Err(error) => {
                 if tui
@@ -1132,7 +1201,7 @@ fn run_tui(yolo: bool) -> anyhow::Result<()> {
             tokio_agent_tui::RunOutcome::ConfigureProvider
             | tokio_agent_tui::RunOutcome::ExtensionsChanged => {
                 agent = loop {
-                    match session::build_session(&cwd, yolo) {
+                    match session::build_session(&cwd) {
                         Ok(agent) => break agent,
                         Err(error) => {
                             if tui
@@ -1147,25 +1216,5 @@ fn run_tui(yolo: bool) -> anyhow::Result<()> {
                 };
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn yolo_flag_is_available_for_interactive_and_non_interactive_modes() {
-        let interactive = Cli::try_parse_from(["tokio-agent", "--yolo"]).unwrap();
-        assert!(interactive.yolo);
-
-        let long =
-            Cli::try_parse_from(["tokio-agent", "--yolo", "--non-interactive", "hello"]).unwrap();
-        assert!(long.yolo);
-        assert_eq!(long.non_interactive.as_deref(), Some("hello"));
-
-        let short = Cli::try_parse_from(["tokio-agent", "-p", "hello"]).unwrap();
-        assert_eq!(short.non_interactive.as_deref(), Some("hello"));
-        assert!(Cli::try_parse_from(["tokio-agent", "--print", "hello"]).is_err());
     }
 }

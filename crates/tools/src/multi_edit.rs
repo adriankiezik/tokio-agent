@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use tokio_agent_core::provider::BoxFuture;
 use tokio_agent_core::tool::{Tool, ToolCtx, ToolDef, ToolResult};
 
-use crate::edit::{Replacement, apply_replacement, edit_permission};
+use crate::edit::{Replacement, apply_replacement, edit_summary};
 use crate::fs::{display_path, resolve, write_file};
 
 pub struct MultiEdit;
@@ -45,8 +45,12 @@ impl Tool for MultiEdit {
         }
     }
 
-    fn permission(&self, input: &Value) -> tokio_agent_core::tool::PermissionRequest {
-        edit_permission("multi_edit", input)
+    fn effect(&self) -> tokio_agent_core::tool::ToolEffect {
+        tokio_agent_core::tool::ToolEffect::Edit
+    }
+
+    fn summary(&self, input: &Value) -> Option<String> {
+        edit_summary(input)
     }
 
     fn run<'a>(&'a self, input: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {

@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_agent_core::provider::BoxFuture;
-use tokio_agent_core::tool::{Action, PermissionRequest, Tool, ToolCtx, ToolDef, ToolResult};
+use tokio_agent_core::tool::{Tool, ToolCtx, ToolDef, ToolEffect, ToolResult};
 
 use crate::fs::{display_path, resolve, write_file};
 
@@ -42,8 +42,12 @@ impl Tool for Edit {
         }
     }
 
-    fn permission(&self, input: &Value) -> PermissionRequest {
-        edit_permission("edit", input)
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Edit
+    }
+
+    fn summary(&self, input: &Value) -> Option<String> {
+        edit_summary(input)
     }
 
     fn run<'a>(&'a self, input: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {
@@ -82,16 +86,11 @@ impl Tool for Edit {
     }
 }
 
-pub(crate) fn edit_permission(tool: &str, input: &Value) -> PermissionRequest {
-    let path = input
+pub(crate) fn edit_summary(input: &Value) -> Option<String> {
+    input
         .get("path")
         .and_then(Value::as_str)
-        .unwrap_or("<missing>");
-    PermissionRequest {
-        tool: tool.to_owned(),
-        summary: format!("edit {path}"),
-        action: Action::Edit,
-    }
+        .map(|path| format!("edit {path}"))
 }
 
 pub(crate) fn apply_replacement(

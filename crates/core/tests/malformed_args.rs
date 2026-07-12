@@ -10,9 +10,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_agent_core::agent::{AgentEvent, UiCommand};
 use tokio_agent_core::event::{Event, StopReason};
 use tokio_agent_core::message::{ContentBlock, Message, Role, ToolCallId, ToolOutput};
-use tokio_agent_core::permission::{Mode, PermissionEngine};
 use tokio_agent_core::provider::{BoxFuture, Capabilities, Provider, ProviderError, Request};
-use tokio_agent_core::tool::{Action, PermissionRequest, Tool, ToolCtx, ToolDef, ToolResult};
+use tokio_agent_core::tool::{Tool, ToolCtx, ToolDef, ToolEffect, ToolResult};
 
 struct OneShotProvider {
     message: Message,
@@ -70,12 +69,8 @@ impl Tool for CountingTool {
         }
     }
 
-    fn permission(&self, _input: &Value) -> PermissionRequest {
-        PermissionRequest {
-            tool: "read".to_owned(),
-            summary: "read".to_owned(),
-            action: Action::Read,
-        }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Read
     }
 
     fn run<'a>(&'a self, _input: Value, _ctx: &'a ToolCtx) -> BoxFuture<'a, ToolResult> {
@@ -107,7 +102,7 @@ async fn malformed_tool_args_become_is_error_result_without_running_the_tool() {
             served: AtomicUsize::new(0),
         },
         tools,
-        PermissionEngine::new(Mode::FullAuto),
+        None,
         tokio_agent_core::ModelConfig {
             model: "m".to_owned(),
             system: "s".to_owned(),
@@ -139,11 +134,11 @@ async fn malformed_tool_args_become_is_error_result_without_running_the_tool() {
     }
     command_tx.send(UiCommand::Shutdown).unwrap();
     session.await.unwrap();
-    let saw_permission_prompt = events
+    let saw_interaction = events
         .iter()
-        .any(|event| matches!(event, AgentEvent::PermissionNeeded { .. }));
+        .any(|event| matches!(event, AgentEvent::InteractionRequested(_)));
     assert!(
-        !saw_permission_prompt,
+        !saw_interaction,
         "full-auto must not raise a permission prompt"
     );
     assert!(events.iter().any(|event| matches!(

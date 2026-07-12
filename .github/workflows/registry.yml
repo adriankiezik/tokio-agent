@@ -25,9 +25,11 @@ jobs:
         run: |
           cargo build --release --target wasm32-unknown-unknown --manifest-path registry/extensions/loop/Cargo.toml
           cargo build --release --target wasm32-unknown-unknown --manifest-path registry/extensions/goal/Cargo.toml
-          mkdir -p registry/extensions/loop/component registry/extensions/goal/component
+          cargo build --release --target wasm32-unknown-unknown --manifest-path registry/extensions/permissions/Cargo.toml
+          mkdir -p registry/extensions/loop/component registry/extensions/goal/component registry/extensions/permissions/component
           wasm-tools component new "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/tokio_loop.wasm" -o registry/extensions/loop/component/extension.wasm
           wasm-tools component new "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/tokio_goal.wasm" -o registry/extensions/goal/component/extension.wasm
+          wasm-tools component new "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/tokio_permissions.wasm" -o registry/extensions/permissions/component/extension.wasm
       - name: Generate signed immutable registry
         env:
           REGISTRY_INDEX_SIGNING_KEY: ${{ secrets.REGISTRY_INDEX_SIGNING_KEY }}

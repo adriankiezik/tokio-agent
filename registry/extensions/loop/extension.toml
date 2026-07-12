@@ -1,7 +1,7 @@
 manifest_version = 1
 id = "tokio.loop"
 name = "Loop"
-version = "1.0.2"
+version = "1.0.0"
 description = "Run a prompt repeatedly on a fixed-delay interval"
 license = "MIT"
 host_api = ">=1.0, <2.0"
