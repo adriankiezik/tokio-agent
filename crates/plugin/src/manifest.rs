@@ -219,6 +219,9 @@ impl ExtensionManifest {
             if let Some(prompt) = &command.prompt {
                 validate_relative(prompt)?;
             }
+            if let Some(handler) = &command.handler {
+                validate_symbol_name(handler)?;
+            }
         }
         let mut skills = BTreeSet::new();
         for skill in &self.skills {
@@ -230,8 +233,8 @@ impl ExtensionManifest {
         }
         let mut tools = BTreeSet::new();
         for tool in &self.tools {
-            validate_name(&tool.name)?;
-            validate_name(&tool.handler)?;
+            validate_symbol_name(&tool.name)?;
+            validate_symbol_name(&tool.handler)?;
             if !tools.insert(&tool.name) {
                 return Err(ManifestError::DuplicateContribution(tool.name.clone()));
             }
@@ -239,7 +242,7 @@ impl ExtensionManifest {
         let mut statuses = BTreeSet::new();
         for status in &self.status {
             validate_name(&status.id)?;
-            validate_name(&status.handler)?;
+            validate_symbol_name(&status.handler)?;
             if !statuses.insert(&status.id) {
                 return Err(ManifestError::DuplicateContribution(status.id.clone()));
             }
@@ -309,6 +312,18 @@ fn validate_id(id: &str) -> Result<(), ManifestError> {
 }
 fn validate_name(name: &str) -> Result<(), ManifestError> {
     if is_name(name) && name.len() <= 64 {
+        Ok(())
+    } else {
+        Err(ManifestError::ContributionName(name.to_owned()))
+    }
+}
+fn validate_symbol_name(name: &str) -> Result<(), ManifestError> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        });
+    if valid {
         Ok(())
     } else {
         Err(ManifestError::ContributionName(name.to_owned()))
