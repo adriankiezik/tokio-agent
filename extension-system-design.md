@@ -18,7 +18,7 @@ tokio-agent is well positioned for extensions, but the extension mechanism shoul
 
 The implementation begins with local Markdown commands and a data-driven command catalog. The programmable runtime and registries can then be built on top of that stable contribution model. `/loop` is the first built-in service migrated to an official extension, followed by `/goal`.
 
-## Implementation status and deployment prerequisites
+## Implementation and deployment status
 
 The architecture in this document is implemented in the workspace:
 
@@ -31,7 +31,7 @@ The architecture in this document is implemented in the workspace:
 - Dynamic model tools are snapshotted at request boundaries, identify their owning extension in permission requests, and are removed on deactivation. Structured status remains cached host-rendered data.
 - Goal and Loop are ordinary official component sources under `registry/extensions`; their old feature-specific core state and command variants have been removed. They are not installed or enabled by default.
 
-Production publication still deliberately requires the operational inputs identified by this design: a root-key ceremony, the public root embedded with `TOKIO_AGENT_OFFICIAL_ROOT_JSON` at release build time, and CI publication credentials. Development and integration testing use explicitly identified fixture roots and do not silently establish official trust.
+The production root-key ceremony and first publication are complete. The public trust root is checked into the plugin and may be overridden with `TOKIO_AGENT_OFFICIAL_ROOT_JSON` during a root rotation. Signed metadata is served from `https://adriankiezik.github.io/tokio-agent`, and immutable Goal and Loop archives are GitHub Release assets. Private signing material remains outside the repository.
 
 ## Current project architecture
 
@@ -1105,8 +1105,8 @@ The following decisions are part of the implementation contract:
 
 ### Remaining implementation details
 
-No product or architecture decision is currently blocking implementation. Ordinary internal representations may be selected where behavior is constrained by this document. Production launch still requires an operational TUF root-key ceremony and GitHub publication credentials, but implementation and fixture-based integration testing do not depend on those external secrets.
+No product, architecture, or release-operation decision is currently blocking implementation. The production trust root, delegated index signing configuration, GitHub Pages deployment, and first official package publication are complete.
 
 ## Release operations
 
-Before the first production registry release, perform the root-key ceremony, embed the resulting public root in release builds, configure the registry signing secret and GitHub Pages environment, and run the signed publication workflow. These are operational trust and deployment steps rather than missing implementation.
+The first production registry release was published as `v0.1.0`. Ongoing operations must refresh the signed index before its expiry, preserve immutable versioned release assets, keep the offline root key out of CI, and use root rotation when changing delegated index keys.
