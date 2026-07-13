@@ -323,6 +323,7 @@ fn run_extension(command: ExtensionCommand) -> anyhow::Result<()> {
                 &manifest.id,
                 &manifest.version,
                 &manifest.capabilities.as_set(),
+                ScriptValidation::Execute,
             )?;
             println!("✓ {} {} is valid", manifest.id, manifest.version);
         }
@@ -686,6 +687,7 @@ fn install_registry_extension(args: InstallArgs) -> anyhow::Result<()> {
                 &package.id,
                 &package.version,
                 &package.capabilities,
+                ScriptValidation::Static,
             )
         })
         .and_then(|()| {
@@ -720,11 +722,18 @@ fn install_registry_extension(args: InstallArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ScriptValidation {
+    Static,
+    Execute,
+}
+
 fn validate_programmable_package(
     root: &Path,
     expected_id: &str,
     expected_version: &str,
     expected_capabilities: &std::collections::BTreeSet<tokio_agent_extension_api::Capability>,
+    validation: ScriptValidation,
 ) -> anyhow::Result<()> {
     let manifest = tokio_agent_plugin::validate_package(root, &semver::Version::new(1, 0, 0))?;
     if manifest.id != expected_id || manifest.version != expected_version {
@@ -741,6 +750,16 @@ fn validate_programmable_package(
         return Ok(());
     };
     let script_path = root.join(runtime.javascript);
+    let source = std::fs::read_to_string(&script_path)
+        .with_context(|| format!("reading UTF-8 JavaScript at {}", script_path.display()))?;
+    if source.len()
+        > tokio_agent_extension_api::RuntimeLimits::default().maximum_payload_bytes as usize
+    {
+        anyhow::bail!("extension JavaScript source exceeded its size limit");
+    }
+    if matches!(validation, ScriptValidation::Static) {
+        return Ok(());
+    }
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -1028,6 +1047,7 @@ fn build_extension_script(path: &Path) -> anyhow::Result<()> {
         &manifest.id,
         &manifest.version,
         &manifest.capabilities.as_set(),
+        ScriptValidation::Execute,
     )?;
     println!(
         "Built {} {} at {}",
