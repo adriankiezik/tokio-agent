@@ -820,7 +820,7 @@ impl ExtensionRuntime {
         }
         let (reply, receive) = mpsc::channel();
         if self.tx.send(Request::Shutdown { reply }).is_ok() {
-            let _ = receive.recv_timeout(std::time::Duration::from_secs(2));
+            let _ = receive.recv();
         }
     }
 
