@@ -12,15 +12,18 @@ use tokio_agent_extension_api::{
     COMPANION_PROTOCOL_VERSION, ExtensionAction, ExtensionId, HOST_API_VERSION, HostRequest,
     HostResponse, RuntimeLimits, Sequenced,
 };
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Cache, CacheConfig, Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 mod bindings {
     wasmtime::component::bindgen!({
-        path: "wit",
+        path: "../../wit",
         world: "extension",
     });
 }
+
+const INITIALIZATION_FUEL: u64 = 100_000_000;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +36,17 @@ struct ComponentToolResult {
 
 struct HostState {
     limits: StoreLimits,
+    table: ResourceTable,
+    wasi: WasiCtx,
+}
+
+impl WasiView for HostState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
 }
 
 struct Instance {
@@ -45,8 +59,22 @@ struct Instance {
 
 struct Host {
     engine: Engine,
+    runtime_component: Component,
     instances: BTreeMap<ExtensionId, Instance>,
     next_sequence: u64,
+}
+
+fn read_script(path: &str, maximum_bytes: usize) -> anyhow::Result<String> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading JavaScript extension metadata at {path}"))?;
+    if !metadata.is_file() {
+        anyhow::bail!("JavaScript extension entrypoint is not a file");
+    }
+    if metadata.len() > maximum_bytes as u64 {
+        anyhow::bail!("JavaScript extension source exceeded its limit");
+    }
+    std::fs::read_to_string(path)
+        .with_context(|| format!("reading UTF-8 JavaScript extension at {path}"))
 }
 
 impl Host {
@@ -62,8 +90,13 @@ impl Host {
             config.cache(Some(Cache::new(cache_config)?));
         }
         let engine = Engine::new(&config)?;
+        let runtime_component = Component::new(
+            &engine,
+            include_bytes!("../runtime/js-runtime.component.wasm"),
+        )?;
         Ok(Self {
             engine,
+            runtime_component,
             instances: BTreeMap::new(),
             next_sequence: 0,
         })
@@ -97,50 +130,68 @@ impl Host {
                     host_api: HOST_API_VERSION.to_owned(),
                 })
             }
-            HostRequest::ValidateComponent { component_path } => {
-                let component = Component::from_file(&self.engine, &component_path)
+            HostRequest::ValidateScript { script_path } => {
+                let limits = RuntimeLimits::default();
+                let source = read_script(&script_path, limits.maximum_payload_bytes as usize)
                     .map_err(|error| (None, error.to_string(), false))?;
-                let component_type = component.component_type();
-                if let Some((name, _)) = component_type.imports(&self.engine).next() {
-                    return Err((None, format!("undeclared component import `{name}`"), false));
+                let mut instance = self
+                    .load(0, limits)
+                    .await
+                    .map_err(|error| (None, error.to_string(), false))?;
+                instance
+                    .store
+                    .set_fuel(INITIALIZATION_FUEL)
+                    .map_err(|error| (None, error.to_string(), false))?;
+                let validation = instance
+                    .bindings
+                    .call_validate_source(&mut instance.store, &source)
+                    .map_err(|error| (None, error.to_string(), false))?;
+                if !validation.is_empty() {
+                    return Err((
+                        None,
+                        format!("invalid extension JavaScript: {validation}"),
+                        false,
+                    ));
                 }
-                let exports: std::collections::BTreeSet<_> = component_type
-                    .exports(&self.engine)
-                    .map(|(name, _)| name.to_owned())
-                    .collect();
-                for required in [
-                    "on-command",
-                    "on-event",
-                    "on-tool",
-                    "authorize-tool",
-                    "on-interaction-response",
-                    "load-state",
-                    "restore-session-state",
-                ] {
-                    if !exports.contains(required) {
-                        return Err((
+                let settings = serde_json::json!({
+                    "_tokio_source": source,
+                    "_tokio_extension_id": "validation.extension",
+                    "_host_generation": 0,
+                })
+                .to_string();
+                instance
+                    .store
+                    .set_fuel(INITIALIZATION_FUEL)
+                    .map_err(|error| (None, error.to_string(), false))?;
+                instance
+                    .bindings
+                    .call_load_state(&mut instance.store, &[], &[], &settings, "{}")
+                    .map_err(|error| {
+                        (
                             None,
-                            format!("missing required component export `{required}`"),
+                            format!("invalid extension JavaScript: {error}"),
                             false,
-                        ));
-                    }
-                }
-                Ok(HostResponse::ComponentValid)
+                        )
+                    })?;
+                Ok(HostResponse::ScriptValid)
             }
             HostRequest::Load {
                 extension,
                 generation,
-                component_path,
+                script_path,
                 capabilities: _,
                 limits,
                 user_state,
                 settings,
                 startup_settings,
             } => {
+                let source = read_script(&script_path, limits.maximum_payload_bytes as usize)
+                    .map_err(|error| (Some(extension.clone()), error.to_string(), false))?;
                 let settings_size = settings
                     .to_string()
                     .len()
-                    .saturating_add(startup_settings.to_string().len());
+                    .saturating_add(startup_settings.to_string().len())
+                    .saturating_add(source.len());
                 if user_state.len().saturating_add(settings_size)
                     > limits.maximum_payload_bytes as usize
                 {
@@ -151,11 +202,40 @@ impl Host {
                     ));
                 }
                 let mut instance = self
-                    .load(&component_path, generation, limits)
+                    .load(generation, limits)
                     .await
                     .map_err(|error| (Some(extension.clone()), error.to_string(), false))?;
+                instance
+                    .store
+                    .set_fuel(INITIALIZATION_FUEL)
+                    .map_err(|error| (Some(extension.clone()), error.to_string(), false))?;
+                let validation = instance
+                    .bindings
+                    .call_validate_source(&mut instance.store, &source)
+                    .map_err(|error| (Some(extension.clone()), error.to_string(), false))?;
+                if !validation.is_empty() {
+                    return Err((
+                        Some(extension.clone()),
+                        format!("invalid extension JavaScript: {validation}"),
+                        false,
+                    ));
+                }
+                let mut settings = settings;
+                let object = settings.as_object_mut().ok_or_else(|| {
+                    (
+                        Some(extension.clone()),
+                        "extension settings must be an object".into(),
+                        false,
+                    )
+                })?;
+                object.insert("_tokio_source".into(), source.into());
+                object.insert("_tokio_extension_id".into(), extension.as_str().into());
                 let settings = settings.to_string();
                 let startup_settings = startup_settings.to_string();
+                instance
+                    .store
+                    .set_fuel(INITIALIZATION_FUEL)
+                    .map_err(|error| (Some(extension.clone()), error.to_string(), false))?;
                 instance
                     .bindings
                     .call_load_state(
@@ -323,20 +403,9 @@ impl Host {
         }
     }
 
-    async fn load(
-        &self,
-        path: &str,
-        generation: u64,
-        limits: RuntimeLimits,
-    ) -> anyhow::Result<Instance> {
-        let component = Component::from_file(&self.engine, path)
-            .with_context(|| format!("loading component {path}"))?;
-        if let Some((name, _)) = component.component_type().imports(&self.engine).next() {
-            anyhow::bail!("undeclared component import `{name}`");
-        }
-        let linker = Linker::new(&self.engine);
-        // Deliberately no WASI or host imports are linked. Components have no
-        // ambient filesystem, network, clock, environment, or process access.
+    async fn load(&self, generation: u64, limits: RuntimeLimits) -> anyhow::Result<Instance> {
+        let mut linker = Linker::new(&self.engine);
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(limits.memory_bytes as usize)
             .instances(32)
@@ -346,13 +415,20 @@ impl Host {
             &self.engine,
             HostState {
                 limits: store_limits,
+                table: ResourceTable::new(),
+                wasi: {
+                    let mut wasi = WasiCtxBuilder::new();
+                    wasi.allow_tcp(false).allow_udp(false);
+                    wasi.build()
+                },
             },
         );
         store.limiter(|state| &mut state.limits);
         store.set_fuel(limits.fuel_per_callback)?;
         store.set_epoch_deadline(1);
-        let bindings = bindings::Extension::instantiate(&mut store, &component, &linker)
-            .context("instantiating extension component")?;
+        let bindings =
+            bindings::Extension::instantiate(&mut store, &self.runtime_component, &linker)
+                .context("instantiating JavaScript extension runtime")?;
         Ok(Instance {
             generation,
             limits,

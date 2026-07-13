@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["crates/extension-runtime"]
 members = [
     "crates/extension-api",
     "crates/extension-host",
@@ -33,7 +34,7 @@ tokio-agent-config = { path = "crates/config" }
 tokio-agent-auth = { path = "crates/auth" }
 tokio-agent-mcp = { path = "crates/mcp" }
 tokio-agent-plugin = { path = "crates/plugin" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "io-std", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "io-std", "time", "signal", "net"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -70,6 +71,7 @@ semver = { version = "1", features = ["serde"] }
 walkdir = "2"
 ed25519-dalek = "2"
 wasmtime = { version = "38", default-features = false, features = ["async", "cache", "component-model", "cranelift", "runtime"] }
+wasmtime-wasi = { version = "38", default-features = false, features = ["p2"] }
 tar = "0.4"
 flate2 = "1"
 

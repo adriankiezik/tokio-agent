@@ -15,21 +15,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
         with:
-          targets: wasm32-unknown-unknown
-      - uses: taiki-e/install-action@wasm-tools
-      - name: Build official components from reviewed source
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/extension-target
+          node-version: 22
+          cache: npm
+          cache-dependency-path: registry/extensions/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build official extensions from reviewed TypeScript
         run: |
-          cargo build --release --target wasm32-unknown-unknown --manifest-path registry/extensions/loop/Cargo.toml
-          cargo build --release --target wasm32-unknown-unknown --manifest-path registry/extensions/goal/Cargo.toml
-          cargo build --release --target wasm32-unknown-unknown --manifest-path registry/extensions/permissions/Cargo.toml
-          mkdir -p registry/extensions/loop/component registry/extensions/goal/component registry/extensions/permissions/component
-          wasm-tools component new "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/tokio_loop.wasm" -o registry/extensions/loop/component/extension.wasm
-          wasm-tools component new "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/tokio_goal.wasm" -o registry/extensions/goal/component/extension.wasm
-          wasm-tools component new "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/tokio_permissions.wasm" -o registry/extensions/permissions/component/extension.wasm
+          npm ci --prefix registry/extensions
+          npm run build --prefix registry/extensions
       - name: Generate signed immutable registry
         env:
           REGISTRY_INDEX_SIGNING_KEY: ${{ secrets.REGISTRY_INDEX_SIGNING_KEY }}
@@ -56,7 +52,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "Official extension packages"
-          gh release upload "$GITHUB_REF_NAME" registry/site/packages/*
+          gh release upload "$GITHUB_REF_NAME" registry/site/packages/* --clobber
         if: startsWith(github.ref, 'refs/tags/')
 
   deploy-pages:

@@ -1,0 +1,14 @@
+{
+  "name": "tokio-agent-official-extensions",
+  "private": true,
+  "scripts": {
+    "build": "npm run build:loop && npm run build:goal && npm run build:permissions",
+    "build:loop": "tsc -p loop/tsconfig.json",
+    "build:goal": "tsc -p goal/tsconfig.json",
+    "build:permissions": "tsc -p permissions/tsconfig.json",
+    "check": "tsc -p loop/tsconfig.json --noEmit && tsc -p goal/tsconfig.json --noEmit && tsc -p permissions/tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

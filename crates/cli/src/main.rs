@@ -135,8 +135,14 @@ struct AliasArgs {
 fn privileged_capability_warning(
     capabilities: &std::collections::BTreeSet<tokio_agent_extension_api::Capability>,
 ) -> &'static str {
-    if capabilities.contains(&tokio_agent_extension_api::Capability::ToolGate) {
+    let tool_gate = capabilities.contains(&tokio_agent_extension_api::Capability::ToolGate);
+    let network = capabilities.contains(&tokio_agent_extension_api::Capability::NetworkRequest);
+    if tool_gate && network {
+        "; WARNING: tool_gate grants global tool authority and network_request allows HTTPS requests to any public internet origin"
+    } else if tool_gate {
         "; WARNING: tool_gate grants global authority to allow or deny every tool invocation"
+    } else if network {
+        "; WARNING: network_request allows HTTPS requests to any public internet origin"
     } else {
         ""
     }
@@ -312,9 +318,15 @@ fn run_extension(command: ExtensionCommand) -> anyhow::Result<()> {
         ExtensionCommand::Check { path } => {
             let manifest =
                 tokio_agent_plugin::validate_package(&path, &semver::Version::new(1, 0, 0))?;
+            validate_programmable_package(
+                &path,
+                &manifest.id,
+                &manifest.version,
+                &manifest.capabilities.as_set(),
+            )?;
             println!("✓ {} {} is valid", manifest.id, manifest.version);
         }
-        ExtensionCommand::Build { path } => build_extension_component(&path)?,
+        ExtensionCommand::Build { path } => build_extension_script(&path)?,
         ExtensionCommand::New { name } => {
             create_extension(&cwd.join(&name), &name)?;
             println!("Created {name}/");
@@ -728,20 +740,20 @@ fn validate_programmable_package(
     let Some(runtime) = manifest.runtime else {
         return Ok(());
     };
-    let component_path = root.join(runtime.component);
+    let script_path = root.join(runtime.javascript);
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     tokio_runtime.block_on(async {
         let mut companion = tokio_agent_plugin::CompanionManager::default();
         let response = companion
-            .request(&tokio_agent_extension_api::HostRequest::ValidateComponent {
-                component_path: component_path.to_string_lossy().into_owned(),
+            .request(&tokio_agent_extension_api::HostRequest::ValidateScript {
+                script_path: script_path.to_string_lossy().into_owned(),
             })
             .await?;
         companion.stop().await;
         match response {
-            tokio_agent_extension_api::HostResponse::ComponentValid => Ok(()),
+            tokio_agent_extension_api::HostResponse::ScriptValid => Ok(()),
             tokio_agent_extension_api::HostResponse::Error { message, .. } => {
                 anyhow::bail!(message)
             }
@@ -980,95 +992,48 @@ fn extension_config_path(project: bool, cwd: &Path) -> PathBuf {
     }
 }
 
-fn build_extension_component(path: &Path) -> anyhow::Result<()> {
+fn build_extension_script(path: &Path) -> anyhow::Result<()> {
     let root = std::fs::canonicalize(path).context("resolving extension path")?;
-    let manifest_path = root.join("Cargo.toml");
-    if !manifest_path.is_file() {
-        anyhow::bail!("{} does not contain Cargo.toml", root.display());
+    let tsconfig = root.join("tsconfig.json");
+    if !tsconfig.is_file() {
+        anyhow::bail!("{} does not contain tsconfig.json", root.display());
     }
-
-    let metadata = std::process::Command::new("cargo")
-        .args([
-            "metadata",
-            "--format-version=1",
-            "--no-deps",
-            "--manifest-path",
-        ])
-        .arg(&manifest_path)
+    let output = std::process::Command::new("npx")
+        .args(["--no-install", "tsc", "-p"])
+        .arg(&tsconfig)
+        .current_dir(&root)
         .output()
-        .context("running cargo metadata")?;
-    if !metadata.status.success() {
+        .context("running TypeScript compiler; install Node.js and run `npm install`")?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "cargo metadata failed:\n{}",
-            String::from_utf8_lossy(&metadata.stderr).trim()
+            "extension TypeScript build failed:\n{}{}{}",
+            stdout.trim(),
+            if !stdout.trim().is_empty() && !stderr.trim().is_empty() {
+                "\n"
+            } else {
+                ""
+            },
+            stderr.trim()
         );
     }
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&metadata.stdout).context("reading cargo metadata")?;
-    let target_directory = metadata
-        .get("target_directory")
-        .and_then(serde_json::Value::as_str)
-        .context("cargo metadata did not report a target directory")?;
-    let package = metadata
-        .get("packages")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|packages| packages.first())
-        .context("cargo metadata did not report the extension package")?;
-    let target_name = package
-        .get("targets")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|targets| {
-            targets.iter().find(|target| {
-                target
-                    .get("kind")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("cdylib")))
-            })
-        })
-        .and_then(|target| target.get("name"))
-        .and_then(serde_json::Value::as_str)
-        .context("extension Cargo.toml must define a cdylib target")?
-        .replace('-', "_");
-
-    let status = std::process::Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--target",
-            "wasm32-unknown-unknown",
-            "--manifest-path",
-        ])
-        .arg(&manifest_path)
-        .status()
-        .context("running cargo build")?;
-    if !status.success() {
-        anyhow::bail!(
-            "extension build failed; install the target with `rustup target add wasm32-unknown-unknown`"
-        );
-    }
-
-    let core_wasm = PathBuf::from(target_directory)
-        .join("wasm32-unknown-unknown/release")
-        .join(format!("{target_name}.wasm"));
-    let component = root.join("component/extension.wasm");
-    std::fs::create_dir_all(component.parent().expect("component has parent"))?;
-    let status = std::process::Command::new("wasm-tools")
-        .args(["component", "new"])
-        .arg(&core_wasm)
-        .arg("-o")
-        .arg(&component)
-        .status()
-        .context("running wasm-tools; install it with `cargo install wasm-tools --locked`")?;
-    if !status.success() {
-        anyhow::bail!("wasm-tools failed to create the extension component");
-    }
-
     let manifest = tokio_agent_plugin::validate_package(&root, &semver::Version::new(1, 0, 0))?;
+    let Some(runtime) = &manifest.runtime else {
+        anyhow::bail!("extension has no JavaScript runtime entrypoint");
+    };
+    let script = root.join(&runtime.javascript);
+    validate_programmable_package(
+        &root,
+        &manifest.id,
+        &manifest.version,
+        &manifest.capabilities.as_set(),
+    )?;
     println!(
         "Built {} {} at {}",
         manifest.id,
         manifest.version,
-        component.display()
+        script.display()
     );
     Ok(())
 }
@@ -1084,14 +1049,30 @@ fn create_extension(path: &Path, name: &str) -> anyhow::Result<()> {
     {
         anyhow::bail!("extension name must contain only lowercase letters, digits, and hyphens");
     }
-    std::fs::create_dir_all(path.join("commands"))?;
+    std::fs::create_dir_all(path.join("src"))?;
     let manifest = format!(
-        "manifest_version = 1\nid = \"local.user.{name}\"\nname = \"{name}\"\nversion = \"0.1.0\"\ndescription = \"Local extension\"\nlicense = \"MIT\"\nhost_api = \">=1.0, <2.0\"\n\n[[commands]]\nname = \"{name}\"\ndescription = \"Run {name}\"\nprompt = \"commands/{name}.md\"\n"
+        "manifest_version = 1\nid = \"local.user.{name}\"\nname = \"{name}\"\nversion = \"0.1.0\"\ndescription = \"Local extension\"\nlicense = \"MIT\"\nhost_api = \">=1.0, <2.0\"\n\n[runtime]\njavascript = \"dist/extension.js\"\n\n[[commands]]\nname = \"{name}\"\ndescription = \"Run {name}\"\nhandler = \"{name}_command\"\n"
     );
     std::fs::write(path.join("extension.toml"), manifest)?;
     std::fs::write(
-        path.join("commands").join(format!("{name}.md")),
-        "{{ arguments }}\n",
+        path.join("src/extension.ts"),
+        format!(
+            "tokio.defineExtension({{\n  onCommand(_handler, input) {{\n    return [tokio.actions.submitPrompt(input || \"Hello from {name}\")];\n  }},\n}});\n"
+        ),
+    )?;
+    std::fs::write(
+        path.join("tokio-extension.d.ts"),
+        include_str!("../../../registry/extensions/tokio-extension.d.ts"),
+    )?;
+    std::fs::write(
+        path.join("tsconfig.json"),
+        "{\n  \"compilerOptions\": {\n    \"lib\": [\"ES2020\"],\n    \"module\": \"none\",\n    \"outDir\": \"dist\",\n    \"strict\": true,\n    \"target\": \"ES2020\"\n  },\n  \"files\": [\"tokio-extension.d.ts\", \"src/extension.ts\"]\n}\n",
+    )?;
+    std::fs::write(
+        path.join("package.json"),
+        format!(
+            "{{\n  \"name\": \"{name}\",\n  \"private\": true,\n  \"scripts\": {{ \"build\": \"tsc -p tsconfig.json\" }},\n  \"devDependencies\": {{ \"typescript\": \"5.9.3\" }}\n}}\n"
+        ),
     )?;
     std::fs::write(path.join("README.md"), format!("# {name}\n"))?;
     Ok(())

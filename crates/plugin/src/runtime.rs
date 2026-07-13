@@ -36,6 +36,11 @@ pub enum SupervisorEffect {
         bytes: Vec<u8>,
     },
     InteractionRequested(tokio_agent_extension_api::InteractionRequest),
+    NetworkRequest {
+        owner: ExtensionId,
+        generation: u64,
+        request: tokio_agent_extension_api::NetworkRequest,
+    },
     AutonomyReleased {
         owner: ExtensionId,
     },
@@ -152,8 +157,8 @@ impl SessionSupervisor {
             .request(&HostRequest::Load {
                 extension: id.clone(),
                 generation,
-                component_path: package_root
-                    .join(&runtime.component)
+                script_path: package_root
+                    .join(&runtime.javascript)
                     .to_string_lossy()
                     .into_owned(),
                 capabilities: capabilities.into_iter().collect(),
@@ -423,11 +428,16 @@ impl SessionSupervisor {
         &mut self,
         event: Sequenced<SessionEvent>,
     ) -> Vec<Result<SupervisorEffect, RuntimeError>> {
+        let required_capability = if matches!(event.value, SessionEvent::NetworkResponse(_)) {
+            Capability::NetworkRequest
+        } else {
+            Capability::SessionObserve
+        };
         let enabled = self.state.enabled_extensions().into_iter().any(
             |(extension, generation, capabilities)| {
                 extension == event.extension
                     && generation == event.generation
-                    && capabilities.contains(&Capability::SessionObserve)
+                    && capabilities.contains(&required_capability)
             },
         );
         if !enabled {
@@ -445,6 +455,23 @@ impl SessionSupervisor {
             Ok(_) => vec![Err(RuntimeError::Protocol)],
             Err(error) => vec![Err(error.into())],
         }
+    }
+
+    pub async fn deliver_network_response(
+        &mut self,
+        extension: ExtensionId,
+        generation: u64,
+        response: tokio_agent_extension_api::NetworkResponse,
+    ) -> Vec<Result<SupervisorEffect, RuntimeError>> {
+        let sequence = self.next_event_sequence;
+        self.next_event_sequence = self.next_event_sequence.saturating_add(1);
+        self.deliver(Sequenced {
+            sequence,
+            extension,
+            generation,
+            value: SessionEvent::NetworkResponse(response),
+        })
+        .await
     }
 
     pub fn apply_actions(
@@ -578,6 +605,13 @@ impl SessionSupervisor {
                 ExtensionAction::RequestInteraction(request),
                 ActionOutcome::InteractionRequested(_),
             ) => Ok(SupervisorEffect::InteractionRequested(request)),
+            (ExtensionAction::Fetch(request), ActionOutcome::NetworkRequested(_)) => {
+                Ok(SupervisorEffect::NetworkRequest {
+                    owner,
+                    generation,
+                    request,
+                })
+            }
             (ExtensionAction::Steer { text }, ActionOutcome::Steering(_)) => {
                 Ok(SupervisorEffect::SubmitPrompt {
                     text,

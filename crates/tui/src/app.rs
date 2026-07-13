@@ -184,18 +184,32 @@ fn run_extension_operation(operation: ExtensionOperation) -> io::Result<()> {
             command.args(["remove", &id]);
         }
     }
-    let status = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
+    let output = command.stdin(Stdio::null()).output()?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!(
-            "extension command exited with {status}"
+        Err(io::Error::other(extension_failure_detail(
+            &output.status,
+            &output.stderr,
+            &output.stdout,
         )))
     }
+}
+
+fn extension_failure_detail(
+    status: &impl std::fmt::Display,
+    stderr: &[u8],
+    stdout: &[u8],
+) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = String::from_utf8_lossy(stdout);
+    [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .find(|message| !message.is_empty())
+        .map_or_else(
+            || format!("extension command exited with {status}"),
+            str::to_owned,
+        )
 }
 
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
@@ -372,12 +386,15 @@ impl App {
                 }
                 Ok(Err(error)) => {
                     self.extension_operation = None;
-                    self.projection.extension_operation_failed();
+                    self.projection
+                        .extension_operation_failed(error.to_string());
                     tracing::warn!(%error, "extension operation failed");
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.extension_operation = None;
-                    self.projection.extension_operation_failed();
+                    self.projection.extension_operation_failed(
+                        "Extension operation stopped unexpectedly".to_owned(),
+                    );
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -881,6 +898,18 @@ mod tests {
     fn enhanced_keyboard_reporting_requests_shifted_characters() {
         assert!(
             keyboard_enhancement_flags().contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS)
+        );
+    }
+
+    #[test]
+    fn extension_failure_prefers_captured_stderr() {
+        assert_eq!(
+            extension_failure_detail(&"status 1", b"Error: invalid package\n", b"fallback\n"),
+            "Error: invalid package"
+        );
+        assert_eq!(
+            extension_failure_detail(&"status 1", b"", b""),
+            "extension command exited with status 1"
         );
     }
 }

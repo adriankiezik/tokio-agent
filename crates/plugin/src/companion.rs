@@ -8,6 +8,9 @@ use tokio_agent_extension_api::{
     COMPANION_PROTOCOL_VERSION, HOST_API_VERSION, HostRequest, HostResponse,
 };
 
+const PROTOCOL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const SCRIPT_PREPARATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug, thiserror::Error)]
 pub enum CompanionError {
     #[error("tokio-agent-extension-host could not be located")]
@@ -32,7 +35,9 @@ struct RunningCompanion {
     stdout: BufReader<ChildStdout>,
 }
 
-/// Lazy, session-scoped companion lifecycle. The process receives an empty
+/// Lazy, session-scoped companion lifecycle. The process receives a cleared
+/// environment and shares Wasmtime's on-disk compilation cache with other CLI
+/// processes, while keeping extension state isolated to this session.
 pub struct CompanionManager {
     executable: Option<PathBuf>,
     cache_directory: Option<PathBuf>,
@@ -120,12 +125,9 @@ impl CompanionManager {
     ) -> Result<HostResponse, CompanionError> {
         self.ensure_started().await?;
         let running = self.running.as_mut().ok_or(CompanionError::Exited)?;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            exchange(running, request),
-        )
-        .await
-        .map_err(|_| CompanionError::Timeout)?
+        tokio::time::timeout(request_deadline(request), exchange(running, request))
+            .await
+            .map_err(|_| CompanionError::Timeout)?
     }
 
     pub fn forget_extension(&mut self, extension: &tokio_agent_extension_api::ExtensionId) {
@@ -153,10 +155,9 @@ impl CompanionManager {
         let loads: Vec<_> = self.loads.values().cloned().collect();
         for load in loads {
             let running = self.running.as_mut().ok_or(CompanionError::Exited)?;
-            let response =
-                tokio::time::timeout(std::time::Duration::from_secs(5), exchange(running, &load))
-                    .await
-                    .map_err(|_| CompanionError::Timeout)??;
+            let response = tokio::time::timeout(request_deadline(&load), exchange(running, &load))
+                .await
+                .map_err(|_| CompanionError::Timeout)??;
             if !matches!(response, HostResponse::Loaded { .. }) {
                 return Err(CompanionError::Protocol(
                     "companion failed to restore a loaded extension".into(),
@@ -166,12 +167,10 @@ impl CompanionManager {
         let states: Vec<_> = self.states.values().cloned().collect();
         for restore in states {
             let running = self.running.as_mut().ok_or(CompanionError::Exited)?;
-            let response = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                exchange(running, &restore),
-            )
-            .await
-            .map_err(|_| CompanionError::Timeout)??;
+            let response =
+                tokio::time::timeout(request_deadline(&restore), exchange(running, &restore))
+                    .await
+                    .map_err(|_| CompanionError::Timeout)??;
             if !matches!(response, HostResponse::SessionStateRestored { .. }) {
                 return Err(CompanionError::Protocol(
                     "companion failed to restore extension session state".into(),
@@ -211,7 +210,7 @@ impl CompanionManager {
             stdout: BufReader::new(stdout),
         });
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            SCRIPT_PREPARATION_DEADLINE,
             exchange(
                 self.running.as_mut().ok_or(CompanionError::Exited)?,
                 &HostRequest::Handshake {
@@ -236,6 +235,15 @@ impl CompanionManager {
             let _ = running.child.kill().await;
             let _ = running.child.wait().await;
         }
+    }
+}
+
+fn request_deadline(request: &HostRequest) -> std::time::Duration {
+    match request {
+        HostRequest::ValidateScript { .. } | HostRequest::Load { .. } => {
+            SCRIPT_PREPARATION_DEADLINE
+        }
+        _ => PROTOCOL_DEADLINE,
     }
 }
 
@@ -280,4 +288,21 @@ pub fn locate_companion() -> Result<PathBuf, CompanionError> {
 
 fn is_executable_file(path: &Path) -> bool {
     path.metadata().is_ok_and(|metadata| metadata.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_preparation_has_a_longer_protocol_deadline() {
+        assert_eq!(
+            request_deadline(&HostRequest::ValidateScript {
+                script_path: "extension.js".into(),
+            }),
+            SCRIPT_PREPARATION_DEADLINE
+        );
+        assert_eq!(request_deadline(&HostRequest::Shutdown), PROTOCOL_DEADLINE);
+        assert!(SCRIPT_PREPARATION_DEADLINE > PROTOCOL_DEADLINE);
+    }
 }

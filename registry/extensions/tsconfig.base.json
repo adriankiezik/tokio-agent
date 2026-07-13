@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "lib": ["ES2020"],
+    "module": "none",
+    "noEmitOnError": true,
+    "strict": true,
+    "target": "ES2020"
+  }
+}

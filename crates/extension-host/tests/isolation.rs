@@ -2,45 +2,24 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 use tokio_agent_extension_api::{
-    COMPANION_PROTOCOL_VERSION, ExtensionId, HOST_API_VERSION, HostRequest, HostResponse,
-    RuntimeLimits,
+    COMPANION_PROTOCOL_VERSION, ExtensionAction, ExtensionId, HOST_API_VERSION, HostRequest,
+    HostResponse, RuntimeLimits,
 };
-use wit_component::{ComponentEncoder, StringEncoding, dummy_module, embed_component_metadata};
-use wit_parser::{ManglingAndAbi, Resolve};
-
 #[test]
-fn an_infinite_component_is_deadline_limited_and_the_companion_stays_available() {
+fn scripts_are_isolated_and_official_extensions_run_in_the_shared_runtime() {
     let temporary = tempfile::tempdir().unwrap();
-    let component_path = temporary.path().join("trap.wasm");
-    let mut resolve = Resolve::default();
-    let (package, _) = resolve
-        .push_path(format!("{}/wit", env!("CARGO_MANIFEST_DIR")))
-        .unwrap();
-    let world = resolve.select_world(&[package], Some("extension")).unwrap();
-    let module = dummy_module(&resolve, world, ManglingAndAbi::Standard32);
-    let wat = wasmprinter::print_bytes(&module).unwrap();
-    let wat = wat
-        .replace("(memory (;0;) 0)", "(memory (;0;) 1)")
-        .replace(
-            "(func (;10;) (type 4) (param i32 i32 i32 i32 i32 i32 i32 i32)\n    unreachable\n  )",
-            "(func (;10;) (type 4) (param i32 i32 i32 i32 i32 i32 i32 i32))",
-        )
-        .replace(
-            "(func (;14;) (type 0) (param i32 i32 i32 i32) (result i32)\n    unreachable\n  )",
-            "(func (;14;) (type 0) (param i32 i32 i32 i32) (result i32) i32.const 0)",
-        );
-    let mut module =
-        wat::parse_str(wat.replacen("unreachable", "loop br 0 end unreachable", 1)).unwrap();
-    embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8).unwrap();
-    let component = ComponentEncoder::default()
-        .module(&module)
-        .unwrap()
-        .validate(true)
-        .encode()
-        .unwrap();
-    std::fs::write(&component_path, component).unwrap();
+    let script_path = temporary.path().join("trap.js");
+    std::fs::write(
+        &script_path,
+        "tokio.defineExtension({ onCommand() { while (true) {} } });",
+    )
+    .unwrap();
 
+    let cache = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/extension-host-test-cache");
     let mut child = Command::new(env!("CARGO_BIN_EXE_tokio-agent-extension-host"))
+        .arg("--cache-dir")
+        .arg(cache)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -67,7 +46,7 @@ fn an_infinite_component_is_deadline_limited_and_the_companion_stays_available()
         HostRequest::Load {
             extension: id.clone(),
             generation: 1,
-            component_path: component_path.to_string_lossy().into_owned(),
+            script_path: script_path.to_string_lossy().into_owned(),
             capabilities: Vec::new(),
             limits: RuntimeLimits {
                 callback_deadline_ms: 100,
@@ -98,15 +77,109 @@ fn an_infinite_component_is_deadline_limited_and_the_companion_stays_available()
         HostResponse::Error { .. }
     ));
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+    let security_path = temporary.path().join("security.js");
+    std::fs::write(
+        &security_path,
+        r#"
+          if ([typeof process, typeof require, typeof fetch, typeof WebAssembly]
+              .some((value) => value !== "undefined")) throw new Error("unsafe global exposed");
+          if (!Object.isFrozen(tokio) || !Object.isFrozen(tokio.actions))
+            throw new Error("extension API is mutable");
+          tokio.defineExtension({ onCommand() { return [tokio.actions.fetch("data", "https://example.com")]; } });
+        "#,
+    )
+    .unwrap();
     assert!(matches!(
         exchange(
             &mut stdin,
             &mut stdout,
-            HostRequest::ValidateComponent {
-                component_path: component_path.to_string_lossy().into_owned(),
+            HostRequest::ValidateScript {
+                script_path: security_path.to_string_lossy().into_owned(),
             }
         ),
-        HostResponse::ComponentValid
+        HostResponse::ScriptValid
+    ));
+
+    let invalid_path = temporary.path().join("invalid.js");
+    std::fs::write(&invalid_path, "tokio.defineExtension({").unwrap();
+    let invalid = exchange(
+        &mut stdin,
+        &mut stdout,
+        HostRequest::ValidateScript {
+            script_path: invalid_path.to_string_lossy().into_owned(),
+        },
+    );
+    assert!(
+        matches!(&invalid, HostResponse::Error { message, .. }
+            if message.contains("invalid extension JavaScript")
+                && message.contains("invalid property name")
+                && message.contains("eval_script:1")),
+        "{invalid:?}"
+    );
+
+    let registry =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../registry/extensions");
+    for (name, handler, arguments, expected) in [
+        ("loop", "loop_command", "10s keep going", "submit_prompt"),
+        ("goal", "goal_command", "ship the feature", "register_tool"),
+        (
+            "permissions",
+            "permissions_command",
+            "",
+            "request_interaction",
+        ),
+    ] {
+        let extension = ExtensionId::new(format!("tokio.{name}"));
+        let script_path = registry.join(name).join("dist/extension.js");
+        let loaded = exchange(
+            &mut stdin,
+            &mut stdout,
+            HostRequest::Load {
+                extension: extension.clone(),
+                generation: 1,
+                script_path: script_path.to_string_lossy().into_owned(),
+                capabilities: Vec::new(),
+                limits: RuntimeLimits::default(),
+                user_state: Vec::new(),
+                settings: serde_json::json!({}),
+                startup_settings: serde_json::json!({}),
+            },
+        );
+        assert!(matches!(loaded, HostResponse::Loaded { .. }), "{loaded:?}");
+        let response = exchange(
+            &mut stdin,
+            &mut stdout,
+            HostRequest::InvokeCommand {
+                extension,
+                generation: 1,
+                handler: handler.into(),
+                arguments: arguments.into(),
+            },
+        );
+        let HostResponse::Actions(actions) = response else {
+            panic!("{name} returned {response:?}");
+        };
+        assert!(actions.iter().any(|action| matches!(
+            (&action.value, expected),
+            (ExtensionAction::SubmitPrompt { .. }, "submit_prompt")
+                | (ExtensionAction::RegisterTool(_), "register_tool")
+                | (
+                    ExtensionAction::RequestInteraction(_),
+                    "request_interaction"
+                )
+        )));
+    }
+
+    assert!(matches!(
+        exchange(
+            &mut stdin,
+            &mut stdout,
+            HostRequest::ValidateScript {
+                script_path: script_path.to_string_lossy().into_owned(),
+            }
+        ),
+        HostResponse::ScriptValid
     ));
     let _ = exchange(&mut stdin, &mut stdout, HostRequest::Shutdown);
     assert!(child.wait().unwrap().success());

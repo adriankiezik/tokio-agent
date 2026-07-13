@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use tokio_agent_extension_api::{
-    Capability, ExtensionAction, ExtensionId, Sequenced, StatusSegment, TimerId,
+    Capability, ExtensionAction, ExtensionId, NetworkRequest, Sequenced, StatusSegment, TimerId,
 };
 
 #[derive(Debug, Clone)]
@@ -15,6 +15,7 @@ pub struct SupervisorPolicy {
     pub maximum_status_updates_per_second: usize,
     pub maximum_timers_per_extension: usize,
     pub minimum_timer_interval: Duration,
+    pub maximum_network_requests_per_minute: usize,
 }
 
 impl Default for SupervisorPolicy {
@@ -28,6 +29,7 @@ impl Default for SupervisorPolicy {
             maximum_status_updates_per_second: 10,
             maximum_timers_per_extension: 32,
             minimum_timer_interval: Duration::from_millis(100),
+            maximum_network_requests_per_minute: 30,
         }
     }
 }
@@ -74,6 +76,7 @@ pub enum ActionOutcome {
     StatePersisted,
     UserStatePersisted,
     InteractionRequested(tokio_agent_extension_api::InteractionRequest),
+    NetworkRequested(NetworkRequest),
     AutonomyReleased,
 }
 
@@ -86,6 +89,7 @@ struct RuntimeState {
     automatic_turns: u32,
     recent_submissions: VecDeque<Instant>,
     recent_status_updates: VecDeque<Instant>,
+    recent_network_requests: VecDeque<Instant>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,6 +135,7 @@ impl SupervisorState {
                 automatic_turns: 0,
                 recent_submissions: VecDeque::new(),
                 recent_status_updates: VecDeque::new(),
+                recent_network_requests: VecDeque::new(),
             },
         );
         generation
@@ -368,6 +373,32 @@ fn apply_action(
                 return Err(ActionError::InvalidInteraction);
             }
             Ok(ActionOutcome::InteractionRequested(request))
+        }
+        ExtensionAction::Fetch(request) => {
+            require(state, Capability::NetworkRequest)?;
+            if request.id.is_empty()
+                || request.id.len() > 128
+                || request.url.len() > policy.maximum_payload_bytes
+                || !request
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(ActionError::PayloadLimit);
+            }
+            let cutoff = Instant::now() - Duration::from_secs(60);
+            while state
+                .recent_network_requests
+                .front()
+                .is_some_and(|time| *time < cutoff)
+            {
+                state.recent_network_requests.pop_front();
+            }
+            if state.recent_network_requests.len() >= policy.maximum_network_requests_per_minute {
+                return Err(ActionError::QueueLimit);
+            }
+            state.recent_network_requests.push_back(Instant::now());
+            Ok(ActionOutcome::NetworkRequested(request))
         }
     }
 }

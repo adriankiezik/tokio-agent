@@ -5,8 +5,8 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use semver::Version;
 use tokio_agent_extension_api::{
-    Capability, CommandId, ExtensionAction, ExtensionId, Sequenced, SessionCommand, StatusSegment,
-    StatusSide, StatusTone, ToolDescriptor, ToolEffect, ToolId,
+    Capability, CommandId, ExtensionAction, ExtensionId, NetworkRequest, Sequenced, SessionCommand,
+    StatusSegment, StatusSide, StatusTone, ToolDescriptor, ToolEffect, ToolId,
 };
 use tokio_agent_plugin::{
     ActionError, ActionOutcome, CommandRouter, ExtensionLock, LockedExtension, LockedSource,
@@ -469,7 +469,7 @@ instructions = "skills/testing.md"
 fn action_batches_roll_back_dynamic_tool_collisions() {
     let mut supervisor = tokio_agent_plugin::SessionSupervisor::new(SupervisorPolicy::default());
     // Enable declaratively through the policy state is intentionally exercised
-    // elsewhere; this test uses a component-free manifest and direct actions.
+    // elsewhere; this test uses a runtime-free manifest and direct actions.
     let manifest = tokio_agent_plugin::ExtensionManifest {
         manifest_version: 1,
         id: "example.test.tools".into(),
@@ -576,5 +576,56 @@ fn status_update_rate_is_bounded() {
             })
             .unwrap_err(),
         ActionError::StatusRateLimit
+    );
+}
+
+#[test]
+fn network_requests_require_capability_and_are_rate_limited() {
+    let owner = ExtensionId::new("example.test.network");
+    let mut supervisor = SupervisorState::new(SupervisorPolicy {
+        maximum_network_requests_per_minute: 1,
+        ..SupervisorPolicy::default()
+    });
+    let generation = supervisor.enable(owner.clone(), []);
+    let fetch = || {
+        ExtensionAction::Fetch(NetworkRequest {
+            id: "weather".into(),
+            url: "https://example.com/weather".into(),
+        })
+    };
+    assert_eq!(
+        supervisor
+            .apply(Sequenced {
+                sequence: 1,
+                extension: owner.clone(),
+                generation,
+                value: fetch(),
+            })
+            .unwrap_err(),
+        ActionError::Capability(Capability::NetworkRequest)
+    );
+
+    let generation = supervisor.enable(owner.clone(), [Capability::NetworkRequest]);
+    assert!(matches!(
+        supervisor
+            .apply(Sequenced {
+                sequence: 2,
+                extension: owner.clone(),
+                generation,
+                value: fetch(),
+            })
+            .unwrap(),
+        ActionOutcome::NetworkRequested(_)
+    ));
+    assert_eq!(
+        supervisor
+            .apply(Sequenced {
+                sequence: 3,
+                extension: owner,
+                generation,
+                value: fetch(),
+            })
+            .unwrap_err(),
+        ActionError::QueueLimit
     );
 }

@@ -1,6 +1,9 @@
 package tokio:agent@1.0.0;
 
 world extension {
+    /// Parses and initializes one bundled JavaScript extension source.
+    export validate-source: func(source: string) -> string;
+
     /// Handles a manifest-declared command. The returned JSON must decode to
     /// `list<ExtensionAction>` from tokio-agent-extension-api.
     export on-command: func(handler: string, arguments: string) -> string;

@@ -4,3 +4,6 @@
 .DS_Store
 .tokio-agent/
 registry/extensions/*/component/
+**/node_modules/
+registry/site/
+npm-debug.log*

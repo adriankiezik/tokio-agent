@@ -7,7 +7,7 @@ license = "MIT"
 host_api = ">=1.0, <2.0"
 
 [runtime]
-component = "component/extension.wasm"
+javascript = "dist/extension.js"
 
 [[commands]]
 name = "permissions"

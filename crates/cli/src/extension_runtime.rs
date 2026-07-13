@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 
+use futures::StreamExt;
 use tokio_agent_core::{DynamicToolCatalog, SessionHookEffect, Tool, ToolCtx, ToolDef, ToolResult};
 use tokio_agent_extension_api::{CommandId, ExtensionId, SessionEvent, ToolId};
 use tokio_agent_plugin::{
@@ -94,6 +96,195 @@ enum Request {
             )>,
         >,
     },
+}
+
+const MAX_NETWORK_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_NETWORK_REDIRECTS: usize = 3;
+const MAX_NETWORK_REQUESTS_PER_SETTLEMENT: usize = 32;
+const MAX_CONCURRENT_NETWORK_REQUESTS: usize = 8;
+
+async fn settle_network_effects(
+    supervisor: &mut SessionSupervisor,
+    effects: Vec<SupervisorEffect>,
+) -> Vec<SupervisorEffect> {
+    let mut pending: std::collections::VecDeque<_> = effects.into();
+    let mut settled = Vec::new();
+    let mut request_count = 0;
+    loop {
+        let mut requests = Vec::new();
+        while let Some(effect) = pending.pop_front() {
+            match effect {
+                SupervisorEffect::NetworkRequest {
+                    owner,
+                    generation,
+                    request,
+                } if request_count < MAX_NETWORK_REQUESTS_PER_SETTLEMENT => {
+                    request_count += 1;
+                    requests.push((owner, generation, request));
+                }
+                SupervisorEffect::NetworkRequest { .. } => {
+                    settled.push(SupervisorEffect::Notice {
+                        level: tokio_agent_extension_api::NoticeLevel::Error,
+                        text: "Extension network action chain exceeded its limit".into(),
+                    });
+                }
+                effect => settled.push(effect),
+            }
+        }
+        if requests.is_empty() {
+            break;
+        }
+        let responses = futures::stream::iter(requests)
+            .map(|(owner, generation, request)| async move {
+                (owner, generation, fetch_public(request).await)
+            })
+            .buffer_unordered(MAX_CONCURRENT_NETWORK_REQUESTS)
+            .collect::<Vec<_>>()
+            .await;
+        for (owner, generation, response) in responses {
+            pending.extend(
+                supervisor
+                    .deliver_network_response(owner, generation, response)
+                    .await
+                    .into_iter()
+                    .map(|result| {
+                        result.unwrap_or_else(|error| SupervisorEffect::Notice {
+                            level: tokio_agent_extension_api::NoticeLevel::Error,
+                            text: format!("Extension network response failed: {error}"),
+                        })
+                    }),
+            );
+        }
+    }
+    settled
+}
+
+async fn fetch_public(
+    request: tokio_agent_extension_api::NetworkRequest,
+) -> tokio_agent_extension_api::NetworkResponse {
+    let requested_url = request.url.clone();
+    match try_fetch_public(&request.url).await {
+        Ok((url, status, body)) => tokio_agent_extension_api::NetworkResponse {
+            id: request.id,
+            url,
+            status: Some(status),
+            body: Some(body),
+            error: None,
+        },
+        Err(error) => tokio_agent_extension_api::NetworkResponse {
+            id: request.id,
+            url: requested_url,
+            status: None,
+            body: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+async fn try_fetch_public(url: &str) -> anyhow::Result<(String, u16, String)> {
+    let mut url = reqwest::Url::parse(url)?;
+    for redirect in 0..=MAX_NETWORK_REDIRECTS {
+        let (client, checked) = public_client(&url).await?;
+        let mut response = client
+            .get(checked.clone())
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/plain;q=0.9, */*;q=0.1",
+            )
+            .send()
+            .await?;
+        if response.status().is_redirection() {
+            if redirect == MAX_NETWORK_REDIRECTS {
+                anyhow::bail!("network request exceeded its redirect limit");
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| anyhow::anyhow!("network redirect omitted Location"))?
+                .to_str()?;
+            url = checked.join(location)?;
+            continue;
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_NETWORK_RESPONSE_BYTES as u64)
+        {
+            anyhow::bail!("network response exceeded 256 KiB");
+        }
+        let status = response.status().as_u16();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_NETWORK_RESPONSE_BYTES {
+                anyhow::bail!("network response exceeded 256 KiB");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(bytes)
+            .map_err(|_| anyhow::anyhow!("network response was not UTF-8 text"))?;
+        return Ok((checked.to_string(), status, body));
+    }
+    unreachable!("redirect loop returns or fails")
+}
+
+async fn public_client(url: &reqwest::Url) -> anyhow::Result<(reqwest::Client, reqwest::Url)> {
+    if url.scheme() != "https" {
+        anyhow::bail!("extension network requests require HTTPS");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("extension network URLs cannot contain credentials");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("extension network URL has no host"))?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addresses: Vec<_> = tokio::net::lookup_host((host, port)).await?.collect();
+    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        anyhow::bail!("extension network destination is not a public internet address");
+    }
+    let pinned = SocketAddr::new(addresses[0].ip(), port);
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve(host, pinned)
+        .user_agent("tokio-agent-extension/1")
+        .build()?;
+    Ok((client, url.clone()))
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_public_ipv4(ip),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map_or_else(|| is_public_ipv6(ip), is_public_ipv4),
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || a == 0
+        || a >= 240
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0)
+        || (a == 198 && matches!(b, 18 | 19)))
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (ip.segments()[0] & 0xfe00) == 0xfc00
+        || (ip.segments()[0] & 0xffc0) == 0xfe80
+        || (ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8))
 }
 
 impl ExtensionRuntime {
@@ -209,7 +400,7 @@ impl ExtensionRuntime {
                                 arguments,
                                 reply,
                             } => {
-                                let result = if let Some(error) = &startup_error {
+                                let mut result = if let Some(error) = &startup_error {
                                     Err(anyhow::anyhow!(error.clone()))
                                 } else if let Some(target) = commands.get(&id).cloned() {
                                     supervisor
@@ -224,7 +415,8 @@ impl ExtensionRuntime {
                                 } else {
                                     Err(anyhow::anyhow!("unknown programmable command `{id}`"))
                                 };
-                                if let Ok(effects) = &result {
+                                if let Ok(effects) = &mut result {
+                                    *effects = settle_network_effects(&mut supervisor, std::mem::take(effects)).await;
                                     for effect in effects {
                                         if let SupervisorEffect::SubmitPrompt {
                                             automatic: true,
@@ -258,6 +450,7 @@ impl ExtensionRuntime {
                                         }))
                                         .collect()
                                 };
+                                let effects = settle_network_effects(&mut supervisor, effects).await;
                                 for effect in &effects {
                                     if let SupervisorEffect::SubmitPrompt {
                                         automatic: true,
@@ -285,6 +478,7 @@ impl ExtensionRuntime {
                                             })),
                                     );
                                 }
+                                effects = settle_network_effects(&mut supervisor, effects).await;
                                 for effect in &effects {
                                     if let SupervisorEffect::SubmitPrompt {
                                         automatic: true,
@@ -380,17 +574,23 @@ impl ExtensionRuntime {
                             Request::GateAuthorize { target, invocation, reply } => {
                                 let owner = target.extension.clone();
                                 let generation = target.generation;
-                                let result = supervisor.authorize_tool(
+                                let mut result = supervisor.authorize_tool(
                                     target.extension, generation, target.authorize_handler, invocation,
                                 ).await.and_then(|response| supervisor.apply_gate_response(owner, generation, response)).map_err(anyhow::Error::new);
+                                if let Ok((_, effects)) = &mut result {
+                                    *effects = settle_network_effects(&mut supervisor, std::mem::take(effects)).await;
+                                }
                                 let _ = reply.send(result);
                             }
                             Request::GateRespond { target, invocation_id, response, reply } => {
                                 let owner = target.extension.clone();
                                 let generation = target.generation;
-                                let result = supervisor.respond_to_interaction(
+                                let mut result = supervisor.respond_to_interaction(
                                     target.extension, generation, target.response_handler, invocation_id, response,
                                 ).await.and_then(|response| supervisor.apply_gate_response(owner, generation, response)).map_err(anyhow::Error::new);
+                                if let Ok((_, effects)) = &mut result {
+                                    *effects = settle_network_effects(&mut supervisor, std::mem::take(effects)).await;
+                                }
                                 let _ = reply.send(result);
                             }
                             Request::Tool {                                extension,
@@ -399,7 +599,7 @@ impl ExtensionRuntime {
                                 arguments,
                                 reply,
                             } => {
-                                let result = if let Some(error) = &startup_error {
+                                let mut result = if let Some(error) = &startup_error {
                                     Err(anyhow::anyhow!(error.clone()))
                                 } else {
                                     supervisor
@@ -409,7 +609,12 @@ impl ExtensionRuntime {
                                         .await
                                         .map_err(anyhow::Error::new)
                                 };
-                                if let Ok(result) = &result {
+                                if let Ok(result) = &mut result {
+                                    result.effects = settle_network_effects(
+                                        &mut supervisor,
+                                        std::mem::take(&mut result.effects),
+                                    )
+                                    .await;
                                     for effect in &result.effects {
                                         if let SupervisorEffect::SubmitPrompt {
                                             automatic: true,
@@ -820,6 +1025,9 @@ impl ExtensionRuntime {
                 }
                 SupervisorEffect::SessionStateStored { .. }
                 | SupervisorEffect::AutonomyReleased { .. } => {}
+                SupervisorEffect::NetworkRequest { .. } => output.push(SessionHookEffect::Notice(
+                    "extension network request was not processed".into(),
+                )),
             }
         }
         output
@@ -1049,5 +1257,46 @@ impl Tool for ExtensionTool {
                 Err(error) => ToolResult::error(error.to_string()),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::is_public_ip;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn public_destinations_are_allowed() {
+        assert!(is_public_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(is_public_ip(IpAddr::V6(
+            "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap()
+        )));
+    }
+
+    #[test]
+    fn local_metadata_and_reserved_destinations_are_blocked() {
+        for address in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "2001:db8::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            let address = address.parse::<IpAddr>().unwrap();
+            assert!(!is_public_ip(address), "{address} must be blocked");
+        }
     }
 }

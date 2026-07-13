@@ -309,7 +309,7 @@ fn write_archive(root: &Path, destination: &Path) -> anyhow::Result<()> {
         "README.md",
         "LICENSE",
         "commands",
-        "component",
+        "dist",
         "assets",
     ] {
         let path = root.join(name);

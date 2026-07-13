@@ -368,6 +368,8 @@ fn load_programmable_packages(
     let store = tokio_agent_plugin::PackageStore::user_default(semver::Version::new(1, 0, 0))?;
     let records =
         tokio_agent_plugin::ExtensionLock::load(&store.root().join("installations.lock"))?;
+    let official_identity = tokio_agent_plugin::builtin_official_root()?
+        .map(|root| tokio_agent_plugin::root_fingerprint(&root.signed));
     let mut packages = Vec::new();
     for id in ids {
         let Some(root) = resolve_extension_root(cwd, &id, &user, &project)? else {
@@ -387,9 +389,9 @@ fn load_programmable_packages(
                     .find(|entry| entry.id == id)
                     .with_context(|| format!("missing installation identity for `{id}`"))?;
                 let (identity, privileged_source) = match &record.source {
-                    LockedSource::Registry { root_identity, url } => (
+                    LockedSource::Registry { root_identity, .. } => (
                         root_identity.clone(),
-                        url == tokio_agent_plugin::OFFICIAL_REGISTRY_URL,
+                        registry_is_official(root_identity, official_identity.as_deref()),
                     ),
                     LockedSource::Local { .. } => ("local".to_owned(), true),
                 };
@@ -428,11 +430,11 @@ fn load_programmable_packages(
             .and_then(|all| all.get(&id))
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
-        let component = manifest
+        let script = manifest
             .runtime
             .as_ref()
-            .map(|runtime| root.join(&runtime.component));
-        let metadata = component.as_ref().map(std::fs::metadata).transpose()?;
+            .map(|runtime| root.join(&runtime.javascript));
+        let metadata = script.as_ref().map(std::fs::metadata).transpose()?;
         let modified = metadata
             .as_ref()
             .and_then(|metadata| metadata.modified().ok())
@@ -449,6 +451,10 @@ fn load_programmable_packages(
         });
     }
     Ok(packages)
+}
+
+fn registry_is_official(root_identity: &str, official_identity: Option<&str>) -> bool {
+    official_identity == Some(root_identity)
 }
 
 fn installed_extension_ids(
@@ -781,5 +787,17 @@ mod tests {
 
         assert!(anthropic_names.iter().any(|name| name == "websearch"));
         assert!(!openai_names.iter().any(|name| name == "websearch"));
+    }
+
+    #[test]
+    fn privileged_registry_source_is_matched_by_signed_root_identity() {
+        let identity = tokio_agent_plugin::builtin_official_root()
+            .unwrap()
+            .map(|root| tokio_agent_plugin::root_fingerprint(&root.signed))
+            .expect("official registry root is embedded");
+
+        assert!(registry_is_official(&identity, Some(&identity)));
+        assert!(!registry_is_official("sha256:third-party", Some(&identity)));
+        assert!(!registry_is_official(&identity, None));
     }
 }

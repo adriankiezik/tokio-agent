@@ -1299,8 +1299,9 @@ impl FrontendProjection {
         }
     }
 
-    pub(crate) fn extension_operation_failed(&mut self) {
+    pub(crate) fn extension_operation_failed(&mut self, error: String) {
         self.installing_extension = None;
+        self.command_error = Some(Notification::new(error));
     }
 
     pub(crate) fn extension_manager_height(&self) -> u16 {
@@ -2151,8 +2152,12 @@ mod tests {
                 .contains("[Installing Example extension]")
         );
 
-        projection.extension_operation_failed();
+        projection.extension_operation_failed("Installation failed".to_owned());
         assert_eq!(projection.visible_extensions().len(), 1);
+        assert_eq!(
+            projection.active_command_error(),
+            Some("Installation failed")
+        );
     }
 
     #[test]

@@ -1,0 +1,20 @@
+[package]
+name = "tokio-agent-extension-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+rquickjs = { version = "0.12.1", default-features = false, features = ["std"] }
+serde_json = "1"
+wit-bindgen = "0.46"
+
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = true

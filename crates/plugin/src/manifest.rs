@@ -32,8 +32,6 @@ pub enum ManifestError {
     UnsafePath(String),
     #[error("package file does not exist: {0}")]
     MissingFile(PathBuf),
-    #[error("a runtime component is present but no executable capability was declared")]
-    RuntimeWithoutCapability,
     #[error("tool_gate contribution requires the tool_gate and interaction_request capabilities")]
     ToolGateCapability,
     #[error("invalid CLI option `{0}`")]
@@ -71,7 +69,7 @@ pub struct ExtensionManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeContribution {
-    pub component: String,
+    pub javascript: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,10 +302,7 @@ impl ExtensionManifest {
             }
         }
         if let Some(runtime) = &self.runtime {
-            validate_relative(&runtime.component)?;
-            if !self.capabilities.has_executable_capability() {
-                return Err(ManifestError::RuntimeWithoutCapability);
-            }
+            validate_relative(&runtime.javascript)?;
         } else if self
             .commands
             .iter()
@@ -318,7 +313,7 @@ impl ExtensionManifest {
             || !self.cli_options.is_empty()
         {
             return Err(ManifestError::MissingFile(PathBuf::from(
-                "runtime.component",
+                "runtime.javascript",
             )));
         }
         Ok(())
@@ -348,7 +343,7 @@ pub fn validate_package(
         .iter()
         .filter_map(|command| command.prompt.as_ref())
         .chain(manifest.skills.iter().map(|skill| &skill.instructions))
-        .chain(manifest.runtime.iter().map(|runtime| &runtime.component));
+        .chain(manifest.runtime.iter().map(|runtime| &runtime.javascript));
     for relative in files {
         let candidate = root.join(relative);
         let canonical = fs::canonicalize(&candidate)

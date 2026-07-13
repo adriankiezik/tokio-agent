@@ -247,6 +247,26 @@ pub struct ToolGateInvocation {
     pub frontend: FrontendCapabilities,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkRequest {
+    pub id: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkResponse {
+    pub id: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "decision")]
 pub enum ToolGateResponse {
@@ -281,6 +301,7 @@ pub enum ExtensionAction {
     PersistSessionState(Vec<u8>),
     PersistUserState(Vec<u8>),
     RequestInteraction(InteractionRequest),
+    Fetch(NetworkRequest),
     ReleaseAutonomy,
 }
 
@@ -328,6 +349,7 @@ pub enum SessionEvent {
     ToolFinished { name: String, is_error: bool },
     SessionStopping,
     TimerFired { id: TimerId },
+    NetworkResponse(NetworkResponse),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -388,7 +410,7 @@ pub struct ExtensionSummary {
 }
 
 pub const HOST_API_VERSION: &str = "1.0.0";
-pub const COMPANION_PROTOCOL_VERSION: u32 = 1;
+pub const COMPANION_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -429,13 +451,13 @@ pub enum HostRequest {
         protocol_version: u32,
         host_api: String,
     },
-    ValidateComponent {
-        component_path: String,
+    ValidateScript {
+        script_path: String,
     },
     Load {
         extension: ExtensionId,
         generation: u64,
-        component_path: String,
+        script_path: String,
         capabilities: Vec<Capability>,
         limits: RuntimeLimits,
         #[serde(default)]
@@ -490,7 +512,7 @@ pub enum HostResponse {
         protocol_version: u32,
         host_api: String,
     },
-    ComponentValid,
+    ScriptValid,
     Loaded {
         extension: ExtensionId,
         generation: u64,

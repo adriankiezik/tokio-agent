@@ -19,6 +19,7 @@ tokio-agent-mcp.workspace = true
 tokio-agent-plugin.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+futures.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

@@ -14,13 +14,10 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 wasmtime.workspace = true
+wasmtime-wasi.workspace = true
 
 [dev-dependencies]
-wit-component = { version = "0.239", features = ["dummy-module"] }
-wit-parser = "0.239"
 tempfile = "3"
-wasmprinter = "0.239"
-wat = "1"
 
 [lints]
 workspace = true
