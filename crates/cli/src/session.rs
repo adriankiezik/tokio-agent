@@ -135,6 +135,7 @@ impl<'a> SessionBuilder<'a> {
         agent = agent.with_session_hook(move |event| hook.event(event));
         let watcher_router = Arc::clone(&command_router);
         let watcher_runtime = extension_runtime.clone();
+        let shutdown_runtime = extension_runtime.clone();
         let watcher_cwd = self.cwd.to_path_buf();
         let watcher_settings = extensions.clone();
         let watcher_state = Arc::new(std::sync::Mutex::new((
@@ -178,6 +179,7 @@ impl<'a> SessionBuilder<'a> {
             }
             effects
         });
+        agent = agent.with_shutdown_hook(move || shutdown_runtime.shutdown());
         Ok(agent)
     }
 

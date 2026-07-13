@@ -96,6 +96,9 @@ enum Request {
             )>,
         >,
     },
+    Shutdown {
+        reply: mpsc::Sender<()>,
+    },
 }
 
 const MAX_NETWORK_RESPONSE_BYTES: usize = 256 * 1024;
@@ -393,6 +396,7 @@ impl ExtensionRuntime {
                         loaded_generations.clone();
                     worker_initializing.store(false, Ordering::Release);
                     let mut startup_error_reported = false;
+                    let mut shutdown_reply = None;
                     while let Ok(request) = rx.recv() {
                         match request {
                             Request::Command {
@@ -628,9 +632,16 @@ impl ExtensionRuntime {
                                 }
                                 let _ = reply.send(result);
                             }
+                            Request::Shutdown { reply } => {
+                                shutdown_reply = Some(reply);
+                                break;
+                            }
                         }
                     }
                     supervisor.shutdown().await;
+                    if let Some(reply) = shutdown_reply {
+                        let _ = reply.send(());
+                    }
                 });
             })?;
         Ok(Self {
@@ -786,6 +797,31 @@ impl ExtensionRuntime {
             }
         }
         Ok(())
+    }
+
+    pub fn shutdown(&self) {
+        let owners: Vec<_> = self
+            .generations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        for owner in owners {
+            self.dynamic.disable(owner.as_str());
+        }
+        if let Some(slot) = self
+            .gate_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            slot.detach();
+        }
+        let (reply, receive) = mpsc::channel();
+        if self.tx.send(Request::Shutdown { reply }).is_ok() {
+            let _ = receive.recv_timeout(std::time::Duration::from_secs(2));
+        }
     }
 
     pub fn tool_gate(

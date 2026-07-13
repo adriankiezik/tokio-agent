@@ -120,6 +120,7 @@ pub struct Agent<P: Provider> {
     session_hook: Option<Arc<SessionHookFn>>,
     session_poll: Option<Arc<dyn Fn() -> Vec<SessionHookEffect> + Send + Sync>>,
     hook_pending: Arc<Mutex<Vec<SessionHookEffect>>>,
+    shutdown_hook: ShutdownHook,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +185,7 @@ impl<P: Provider> Agent<P> {
             session_hook: None,
             session_poll: None,
             hook_pending: Arc::new(Mutex::new(Vec::new())),
+            shutdown_hook: ShutdownHook(None),
         }
     }
 
@@ -203,6 +205,15 @@ impl<P: Provider> Agent<P> {
         F: Fn(InteractionResponse) -> Result<(), String> + Send + Sync + 'static,
     {
         self.interaction_responder = Some(Arc::new(responder));
+        self
+    }
+
+    #[must_use]
+    pub fn with_shutdown_hook<F>(mut self, hook: F) -> Self
+    where
+        F: FnOnce() + Send + Sync + 'static,
+    {
+        self.shutdown_hook = ShutdownHook(Some(Box::new(hook)));
         self
     }
 
@@ -866,6 +877,16 @@ impl<P: Provider> Agent<P> {
     }
 }
 
+struct ShutdownHook(Option<Box<dyn FnOnce() + Send + Sync>>);
+
+impl Drop for ShutdownHook {
+    fn drop(&mut self) {
+        if let Some(hook) = self.0.take() {
+            hook();
+        }
+    }
+}
+
 fn apply_session_hook(
     hook: Option<&Arc<SessionHookFn>>,
     event: tokio_agent_extension_api::SessionEvent,
@@ -1127,6 +1148,18 @@ mod tests {
     use crate::provider::{BoxFuture, Capabilities};
     use futures::stream::BoxStream;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn shutdown_hook_runs_when_its_owner_is_dropped() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            let _hook = ShutdownHook(Some(Box::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            })));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     struct CompactingProvider {
         calls: Arc<AtomicUsize>,
